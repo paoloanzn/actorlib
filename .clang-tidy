@@ -1,0 +1,57 @@
+# Strict lint profile for actorlib. Every check family is on and every finding is
+# an error; the exclusions below are deliberate and each one is explained.
+#
+#   readability-identifier-length         Short names (i, p, n) are idiomatic in
+#                                         the small scopes where they are used.
+#   modernize-use-trailing-return-type    Style only; the codebase uses leading
+#                                         return types.
+#   readability-braces-around-statements  Single-statement bodies stay brace-less;
+#   google-readability-braces-around-...  clang-format fixes their indentation and
+#                                         -Wmisleading-indentation catches the
+#                                         hazard the check guards against.
+#   google-readability-todo               No TODO(username) convention.
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  google-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -readability-identifier-length,
+  -modernize-use-trailing-return-type,
+  -readability-braces-around-statements,
+  -google-readability-braces-around-statements,
+  -google-readability-todo
+WarningsAsErrors: '*'
+# Only actorlib's own headers are linted; doctest (under build/_deps) is skipped.
+HeaderFilterRegex: '/(include|src|tests)/'
+FormatStyle: file
+CheckOptions:
+  misc-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic: true
+  readability-implicit-bool-conversion.AllowPointerConditions: true
+  readability-function-cognitive-complexity.IgnoreMacros: true
+  concurrency-mt-unsafe.FunctionSet: glibc
+  readability-identifier-naming.NamespaceCase: lower_case
+  readability-identifier-naming.ClassCase: CamelCase
+  readability-identifier-naming.StructCase: CamelCase
+  readability-identifier-naming.EnumCase: CamelCase
+  readability-identifier-naming.EnumConstantCase: CamelCase
+  readability-identifier-naming.ConceptCase: CamelCase
+  readability-identifier-naming.FunctionCase: camelBack
+  readability-identifier-naming.MethodCase: camelBack
+  readability-identifier-naming.VariableCase: lower_case
+  readability-identifier-naming.ParameterCase: lower_case
+  readability-identifier-naming.MemberCase: lower_case
+  readability-identifier-naming.PrivateMemberSuffix: _
+  readability-identifier-naming.ProtectedMemberSuffix: _
+  # Constants are kCamelCase (kChunkAlign), unlike ordinary variables.
+  readability-identifier-naming.ConstexprVariableCase: CamelCase
+  readability-identifier-naming.ConstexprVariablePrefix: k
+  readability-identifier-naming.TemplateParameterCase: CamelCase
+  readability-identifier-naming.MacroDefinitionCase: UPPER_CASE

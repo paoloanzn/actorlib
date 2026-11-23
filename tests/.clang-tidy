@@ -1,0 +1,21 @@
+# Test-only relaxations on top of the root profile. doctest's macros expand to code
+# the root profile rejects, and the tests' literals are their data.
+#
+#   cppcoreguidelines-avoid-do-while      CHECK/REQUIRE expand to do { } while (false).
+#   cert-err33-c                          CHECK/REQUIRE discard doctest's internal
+#                                         return values.
+#   misc-use-anonymous-namespace          TEST_CASE defines static functions.
+#   readability-magic-numbers             Message counts, sizes and sequence numbers
+#   cppcoreguidelines-avoid-magic-numbers are the test data.
+#   clang-analyzer-cplusplus.NewDelete-   False positive in doctest's String::copy:
+#     Leaks                               DOCTEST_CONFIG_IMPLEMENT puts doctest's
+#                                         implementation in the test file, so the
+#                                         analyzer follows CHECK paths into it.
+InheritParentConfig: true
+Checks: >
+  -cppcoreguidelines-avoid-do-while,
+  -cert-err33-c,
+  -misc-use-anonymous-namespace,
+  -readability-magic-numbers,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -clang-analyzer-cplusplus.NewDeleteLeaks
