@@ -75,7 +75,7 @@ TEST_CASE("messages are delivered in FIFO order across chunk boundaries") {
     CHECK(arena.drain(ref, 100, [&](Ping& p) { seen.push_back(p.seq); }) == 40);
     CHECK(seen == sequence(40));
     CHECK(arena.pending(ref) == 0);
-    CHECK(arena.chunksInUse() == 0);
+    CHECK(arena.chunksInUse() == 1);  // the emptied mailbox keeps its last chunk parked
 }
 
 TEST_CASE("drain handles at most budget messages") {
@@ -128,7 +128,7 @@ TEST_CASE("mailboxes of different message types share the arena independently") 
         CHECK(std::string_view{l.name.data()} == "alice");
     }) == 20);
     CHECK(ids == sequence(20));
-    CHECK(arena.chunksInUse() == 0);
+    CHECK(arena.chunksInUse() == 2);  // one parked chunk per emptied mailbox
 }
 
 TEST_CASE("refs to a destroyed mailbox stay dead, even after its slot is reused") {
@@ -171,7 +171,7 @@ TEST_CASE("a handler can send to its own mailbox while it is drained") {
     CHECK(handled == 41);
     CHECK(seen.front() == 40);
     CHECK(seen.back() == 0);
-    CHECK(arena.chunksInUse() == 0);
+    CHECK(arena.chunksInUse() == 1);
 }
 
 TEST_CASE("a handler can create mailboxes while a mailbox is drained") {
@@ -205,7 +205,7 @@ TEST_CASE("message slots honor the message's alignment") {
     MailboxArena arena;
     auto ref = arena.create<Wide>();
     for (std::uint64_t i = 0; i < 300; ++i) REQUIRE(arena.send(ref, Wide{i}) == SendResult::Ok);
-    CHECK(arena.chunksInUse() == 3);  // (4096 - 32) / 32 = 127 per chunk
+    CHECK(arena.chunksInUse() == 11);  // (960 - 32) / 32 = 29 per chunk
 
     std::uint64_t expected = 0;
     const auto handled = arena.drain(ref, 1000, [&](Wide& w) {
@@ -230,7 +230,93 @@ TEST_CASE("steady send/drain cycles reuse chunks without growing the arena") {
         REQUIRE(arena.drain(b, 1, [](Ping&) {}) == 1);
     }
     CHECK(arena.chunksReserved() == 2);
+    CHECK(arena.chunksInUse() == 2);  // each mailbox refills its parked chunk
+}
+
+TEST_CASE("an emptied mailbox parks its chunk and refills it without taking another") {
+    MailboxArena arena{kSmall};
+    auto ref = arena.create<Ping>();
+    for (std::uint32_t round = 0; round < 3; ++round) {
+        for (std::uint32_t i = 0; i < kPingsPerChunk; ++i) REQUIRE(arena.send(ref, Ping{i}) == SendResult::Ok);
+        CHECK(arena.chunksInUse() == 1);  // the parked chunk is rewound, so all 14 fit again
+        CHECK(arena.drain(ref, 100, [](Ping&) {}) == kPingsPerChunk);
+        CHECK(arena.pending(ref) == 0);
+        CHECK(arena.chunksInUse() == 1);
+    }
+}
+
+TEST_CASE("parked chunks are taken back before the arena grows or reports Full") {
+    MailboxArena arena{kSmall};  // 2 chunks to start, 4 at most
+    std::vector<ActorRef<Ping>> refs;
+    for (int i = 0; i < 4; ++i) {
+        refs.push_back(arena.create<Ping>());
+        REQUIRE(arena.send(refs.back(), Ping{0}) == SendResult::Ok);  // 4 busy mailboxes: grows to the cap
+    }
+    for (const auto& ref : refs) REQUIRE(arena.drain(ref, 1, [](Ping&) {}) == 1);
+    CHECK(arena.chunksInUse() == 4);  // all four parked
+    CHECK(arena.chunksReserved() == 4);
+
+    auto late = arena.create<Ping>();
+    CHECK(arena.send(late, Ping{1}) == SendResult::Ok);  // no free chunk: the parked ones are reclaimed
+    CHECK(arena.chunksInUse() == 1);
+    CHECK(arena.chunksReserved() == 4);
+
+    // The reclaimed mailboxes are empty and take chunks again, up to the cap.
+    for (std::size_t i = 0; i < 3; ++i) {
+        CHECK(arena.pending(refs[i]) == 0);
+        CHECK(arena.send(refs[i], Ping{2}) == SendResult::Ok);
+    }
+    CHECK(arena.send(refs[3], Ping{2}) == SendResult::Full);
+}
+
+TEST_CASE("a mailbox that empties does not make the arena grow by parking") {
+    MailboxArena arena{kSmall};
+    auto a = arena.create<Ping>();
+    auto b = arena.create<Ping>();
+    auto c = arena.create<Ping>();
+    for (const auto& ref : {a, b}) {
+        REQUIRE(arena.send(ref, Ping{0}) == SendResult::Ok);
+        REQUIRE(arena.drain(ref, 1, [](Ping&) {}) == 1);
+    }
+    CHECK(arena.chunksInUse() == 2);                  // both initial chunks parked
+    CHECK(arena.send(c, Ping{0}) == SendResult::Ok);  // reclaims instead of growing
+    CHECK(arena.chunksReserved() == 2);
+}
+
+TEST_CASE("a mailbox whose parking spot holds another parked mailbox gives its chunk back") {
+    MailboxArena arena{kSmall};
+    std::vector<ActorRef<Ping>> refs;
+    for (std::uint32_t i = 0; i <= MailboxArena::kParkingSpots; ++i) refs.push_back(arena.create<Ping>());
+    const auto first = refs.front();  // index 0 and index kParkingSpots share spot 0
+    const auto clash = refs.back();
+    auto cycle = [&](ActorRef<Ping> ref) {
+        REQUIRE(arena.send(ref, Ping{0}) == SendResult::Ok);
+        REQUIRE(arena.drain(ref, 1, [](Ping&) {}) == 1);
+    };
+
+    cycle(first);
+    CHECK(arena.chunksInUse() == 1);  // first parked
+    cycle(clash);
+    CHECK(arena.chunksInUse() == 1);  // first keeps the spot; clash released its chunk
+
+    REQUIRE(arena.send(first, Ping{1}) == SendResult::Ok);  // first is busy again...
+    cycle(clash);                                           // ...so clash takes the spot
+    CHECK(arena.chunksInUse() == 2);
+}
+
+TEST_CASE("destroying a parked mailbox returns its chunk") {
+    MailboxArena arena{kSmall};
+    auto ref = arena.create<Ping>();
+    REQUIRE(arena.send(ref, Ping{0}) == SendResult::Ok);
+    REQUIRE(arena.drain(ref, 1, [](Ping&) {}) == 1);
+    CHECK(arena.chunksInUse() == 1);
+    CHECK(arena.destroy(ref));
     CHECK(arena.chunksInUse() == 0);
+
+    auto reused = arena.create<Ping>();  // same slot and parking spot, new generation
+    REQUIRE(arena.send(reused, Ping{1}) == SendResult::Ok);
+    REQUIRE(arena.drain(reused, 1, [](Ping&) {}) == 1);
+    CHECK(arena.chunksInUse() == 1);
 }
 
 TEST_CASE("invalid configurations and oversized messages are rejected") {

@@ -1,9 +1,6 @@
 #include <algorithm>
-#include <array>
-#include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -15,23 +12,6 @@ namespace {
 // Each slab starts with a cache-line-sized header holding the next-slab link, so the
 // chunks after it stay aligned.
 constexpr std::size_t kSlabHeaderSize = kChunkAlign;
-
-// Links are copied as bytes: the storage is raw bytes, not pointer objects. Compiles to a
-// single load or store.
-using LinkBytes = std::array<std::byte, sizeof(std::byte*)>;
-
-std::byte* nextOf(const std::byte* block) noexcept {
-    LinkBytes raw{};
-    std::memcpy(raw.data(), block, raw.size());
-    return std::bit_cast<std::byte*>(raw);
-}
-
-// Both are chunk (or slab) pointers by nature; the names say which is which.
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-void setNext(std::byte* block, std::byte* next) noexcept {
-    const auto raw = std::bit_cast<LinkBytes>(next);
-    std::memcpy(block, raw.data(), raw.size());
-}
 }  // namespace
 
 MailboxArena::MailboxArena(ArenaConfig config) {
@@ -69,69 +49,61 @@ std::uint32_t MailboxArena::createSlot(std::size_t data_offset, std::size_t msg_
         slots_.emplace_back();
     }
     MailboxSlot& slot = slots_[index];
-    slot.slots_per_chunk = static_cast<std::uint32_t>((chunk_size_ - data_offset) / msg_size);
-    slot.alive = true;
+    const std::size_t per_chunk = (chunk_size_ - data_offset) / msg_size;
+    slot.data_offset = static_cast<std::uint32_t>(data_offset);
+    slot.data_end = static_cast<std::uint32_t>(data_offset + per_chunk * msg_size);
+    parkEmpty(slot);
+    ++slot.generation;  // even (dead) -> odd (alive)
     return index;
 }
 
 bool MailboxArena::destroySlot(std::uint32_t index, std::uint32_t generation) noexcept {
     if (!isValid(index, generation)) return false;
     MailboxSlot& slot = slots_[index];
-    releaseChunks(slot);
-    slot.alive = false;
-    ++slot.generation;  // after 2^32 reuses of one slot a stale ref could match again
+    // Every chunk from the head chunk to the tail chunk belongs to this mailbox.
+    for (std::byte* chunk = slot.head_chunk; chunk != nullptr;) {
+        std::byte* next = chunk == slot.tail_chunk ? nullptr : nextOf(chunk);
+        releaseChunk(chunk);
+        chunk = next;
+    }
+    parkEmpty(slot);
+    ++slot.generation;  // odd -> even; after 2^31 reuses of one slot a stale ref could match again
     slot.next_free = free_slots_;
     free_slots_ = index;
     return true;
 }
 
-bool MailboxArena::appendChunk(MailboxSlot& slot) noexcept {
-    std::byte* chunk = acquireChunk();
-    if (chunk == nullptr) return false;
-    setNext(chunk, nullptr);
-    if (slot.tail_chunk != nullptr) {
-        setNext(slot.tail_chunk, chunk);
-    } else {
-        slot.head_chunk = chunk;
-        slot.head = 0;
+std::size_t MailboxArena::pendingBytes(const MailboxSlot& slot) noexcept {
+    if (isEmpty(slot)) return 0;
+    if (slot.head_chunk == slot.tail_chunk) return slot.tail - slot.head;
+    // The head chunk's rest, every full chunk in between, then the tail chunk's start.
+    std::size_t bytes = slot.data_end - slot.head;
+    for (const std::byte* chunk = nextOf(slot.head_chunk); chunk != slot.tail_chunk; chunk = nextOf(chunk)) {
+        bytes += slot.data_end - slot.data_offset;
     }
-    slot.tail_chunk = chunk;
-    slot.tail = 0;
-    return true;
+    return bytes + (slot.tail - slot.data_offset);
 }
 
-void MailboxArena::popHeadChunk(MailboxSlot& slot) noexcept {
-    std::byte* next = nextOf(slot.head_chunk);
-    releaseChunk(slot.head_chunk);
-    slot.head_chunk = next;
-    slot.head = 0;
-}
-
-void MailboxArena::releaseChunks(MailboxSlot& slot) noexcept {
-    for (std::byte* chunk = slot.head_chunk; chunk != nullptr;) {
-        std::byte* next = nextOf(chunk);
-        releaseChunk(chunk);
-        chunk = next;
+// park() for a mailbox that does not hold its spot yet.
+void MailboxArena::parkElsewhere(std::uint32_t index, MailboxSlot& slot) noexcept {
+    std::uint32_t& spot = spotFor(index);
+    if (spot != kNoSlot && isParked(slots_[spot])) {
+        releaseChunk(slot.head_chunk);
+        parkEmpty(slot);
+        return;
     }
-    slot.head_chunk = nullptr;
-    slot.tail_chunk = nullptr;
-    slot.head = 0;
-    slot.tail = 0;
-    slot.count = 0;
+    spot = index;
+    slot.head = slot.tail = slot.data_offset;
 }
 
-std::byte* MailboxArena::acquireChunk() noexcept {
-    if (free_chunks_ == nullptr && !grow()) return nullptr;
-    std::byte* chunk = free_chunks_;
-    free_chunks_ = nextOf(chunk);
-    ++chunks_in_use_;
-    return chunk;
-}
-
-void MailboxArena::releaseChunk(std::byte* chunk) noexcept {
-    setNext(chunk, free_chunks_);
-    free_chunks_ = chunk;
-    --chunks_in_use_;
+// Out of free chunks: take back the parked ones before asking for more memory.
+bool MailboxArena::reclaimParked() noexcept {
+    for (std::uint32_t& spot : parking_) {
+        if (spot == kNoSlot) continue;
+        unpark(slots_[spot]);
+        spot = kNoSlot;
+    }
+    return free_top_ != 0;
 }
 
 bool MailboxArena::grow() noexcept {
@@ -139,17 +111,17 @@ bool MailboxArena::grow() noexcept {
     if (chunks == 0) return false;
     void* memory = ::operator new(kSlabHeaderSize + chunks * chunk_size_, std::align_val_t{kChunkAlign}, std::nothrow);
     if (memory == nullptr) return false;
+    try {
+        free_.resize(chunks_reserved_ + chunks);  // room for every chunk, so releases never allocate
+    } catch (const std::bad_alloc&) {
+        ::operator delete(memory, std::align_val_t{kChunkAlign});
+        return false;
+    }
     auto* slab = static_cast<std::byte*>(memory);
     setNext(slab, slabs_);
     slabs_ = slab;
     // Push in reverse so chunks are handed out in address order.
-    for (std::size_t i = chunks; i-- > 0;) {
-        // Carving a slab into chunks is byte-level arithmetic inside the block just allocated.
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
-        std::byte* chunk = slab + kSlabHeaderSize + i * chunk_size_;
-        setNext(chunk, free_chunks_);
-        free_chunks_ = chunk;
-    }
+    for (std::size_t i = chunks; i-- > 0;) releaseChunk(at(slab, kSlabHeaderSize + i * chunk_size_));
     chunks_reserved_ += chunks;
     return true;
 }
