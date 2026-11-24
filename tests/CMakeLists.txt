@@ -11,6 +11,6 @@ FetchContent_MakeAvailable(doctest)
 get_target_property(doctest_include_dirs doctest INTERFACE_INCLUDE_DIRECTORIES)
 set_target_properties(doctest PROPERTIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${doctest_include_dirs}")
 
-add_executable(actorlib_tests mailbox_arena.cpp)
+add_executable(actorlib_tests mailbox_arena.cpp virtual_worker.cpp)
 target_link_libraries(actorlib_tests PRIVATE actorlib::actorlib doctest::doctest)
 add_test(NAME actorlib_tests COMMAND actorlib_tests)
