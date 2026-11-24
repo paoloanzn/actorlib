@@ -32,6 +32,7 @@ class Worker;
 
 // What the workers of one VirtualWorker share.
 struct Shared {
+    std::uint64_t id = 0;  // unique to this VirtualWorker, never reused: keys each thread's feeds
     std::vector<std::unique_ptr<Worker>> workers;
     // Actors not stopped yet, plus addActor calls waiting for their actor. Once it reaches 0
     // after start() it stays there: nothing is left that could create an actor.
@@ -39,15 +40,66 @@ struct Shared {
     std::atomic<bool> started{false};
     std::atomic<bool> stopping{false};
     std::atomic<bool> done{false};  // every actor stopped: workers exit and join() returns
+    // Workers whose arena is past its high mark. While any is, no worker takes messages from
+    // outside: they wait in their feeds, and a thread's sends return Full once its backlog
+    // reaches its cap.
+    std::atomic<std::uint32_t> pressured{0};
 
     void release() noexcept;  // one fewer live; the last one after start() calls finish()
     void finish() noexcept;
 };
 
+// Part of a feed: a header line, then envelopes, like a batch.
+struct Segment {
+    std::atomic<Segment*> next{nullptr};      // set once the producer has moved on to it
+    std::atomic<std::uint32_t> committed{0};  // bytes of complete envelopes
+    std::uint32_t capacity = 0;
+};
+
+// Messages from one outside thread to one worker: the thread appends to its tail segment
+// and the worker reads from its head one, so sending takes no lock, no compare-exchange
+// and, once a segment comes back for reuse, no allocation. Each sender's messages stay in
+// order. The thread and the worker both own it; the last to let go frees it.
+// The two halves sit on separate cache lines on purpose: each side writes only its own.
+struct Feed {  // NOLINT(clang-analyzer-optin.performance.Padding)
+    // The sending thread only.
+    Segment* tail = nullptr;
+    std::uint32_t used = 0;      // in tail
+    std::uint64_t produced = 0;  // capacity of every segment added, the first one included
+    // The worker's thread only, after it took the feed from its joining list.
+    alignas(kChunkAlign) Segment* head = nullptr;
+    std::uint32_t read = 0;  // in head
+    Feed* next = nullptr;    // the joining list, then the worker's list of feeds
+    // Written by the worker, read by the sender when it needs a segment.
+    std::atomic<std::uint64_t> consumed{0};  // capacity of every segment read to the end
+    // Both.
+    std::atomic<Segment*> spare{nullptr};  // a read segment, back for the thread to reuse
+    std::atomic<int> owners{2};
+};
+
+// The calling thread's feeds to the workers of the VirtualWorker it last sent through.
+struct FeedCache {
+    std::uint64_t system = 0;  // a Shared::id; 0 for none
+    Feed** feeds = nullptr;    // by worker; null until the thread first sends to that worker
+};
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+inline constinit thread_local FeedCache thread_feed_cache{};
+FeedCache feedsOfThisThread(const Shared& shared) noexcept;  // fills thread_feed_cache
+
+// Whether senders from outside skip the store-load fence before checking that a worker
+// sleeps. A sleeping worker cannot miss their messages anyway: before it sleeps, it makes
+// every running thread of the process execute a full fence (Linux membarrier). Set once,
+// before the first worker starts, and never changed after.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+inline constinit std::atomic<bool> asymmetric_fences{false};
+void releaseFeed(Feed* feed) noexcept;  // by one of its two owners
+
 // One thread of a VirtualWorker. It owns an arena with its actors' mailboxes, the actors
 // themselves and a queue of the ones with messages, and only its thread touches them.
-// Other threads reach it through its inbox: a lock-free list of batches of messages.
-class Worker {
+// Other workers reach it through its inbox: a lock-free list of batches of messages.
+// Threads outside the workers reach it through a feed each. The fields other threads write
+// get a cache line of their own, which is padding the analyzer would rather not see.
+class Worker {  // NOLINT(clang-analyzer-optin.performance.Padding)
 public:
     // An ActorRef's index holds its worker in the top 8 bits and its mailbox in the rest.
     static constexpr std::uint32_t kSlotBits = 24;
@@ -141,11 +193,33 @@ public:
         return SendResult::Ok;
     }
 
-    // Any thread: a batch of its own with one message, straight into this worker's inbox.
+    // Any thread: appended to the calling thread's feed to this worker.
     template <Message Msg, class... Args>
     SendResult postMessage(ActorRef<Msg> to, Args&&... args) {
-        return post<Msg>(Envelope{.run = &deliver<Msg>, .index = to.index_ & kSlotMask, .generation = to.generation_},
-                         std::forward<Args>(args)...);
+        Feed* feed = feedOfThisThread();
+        if (feed == nullptr) [[unlikely]]
+            return SendResult::Full;
+        if (feed->tail->capacity - feed->used < bytesFor<Msg>()) [[unlikely]] {
+            if (!extend(*feed, bytesFor<Msg>())) return SendResult::Full;
+        }
+        Segment& segment = *feed->tail;
+        feed->used = static_cast<std::uint32_t>(
+            write<Msg>(at(segment, 0), feed->used,
+                       Envelope{.run = &deliver<Msg>, .index = to.index_ & kSlotMask, .generation = to.generation_},
+                       std::forward<Args>(args)...));
+        // A worker going to sleep sees the message, or this sees it sleeping. A store-load
+        // fence costs a round trip to the core polling the line, so skip it when the worker
+        // fences for both before it sleeps.
+        if (asymmetric_fences.load(std::memory_order_relaxed)) [[likely]] {
+            segment.committed.store(feed->used, std::memory_order_release);
+            std::atomic_signal_fence(std::memory_order_seq_cst);  // keeps the compiler from swapping the two
+            if (sleep_.load(std::memory_order_relaxed) == kSleeping) [[unlikely]]
+                wake();
+        } else {
+            segment.committed.store(feed->used, std::memory_order_seq_cst);
+            wake();
+        }
+        return SendResult::Ok;
     }
 
     void loop();              // the worker thread's whole life
@@ -212,10 +286,11 @@ private:
     };
     static constexpr std::size_t kBatchHeader = kChunkAlign;  // keeps the envelopes 64-byte aligned
     static constexpr std::uint32_t kBatchBytes = 4096 - kBatchHeader;
+    static constexpr std::uint32_t kSegmentBytes = 16384 - kBatchHeader;  // a feed's usual segment
 
-    // One message, or a command, in a batch. The payload follows at its own alignment.
+    // One message, or a command, in a batch or a feed. The payload follows at its own alignment.
     struct Envelope {
-        using Run = void (*)(Worker&, Envelope&);
+        using Run = SendResult (*)(Worker&, Envelope&);
         Run run = nullptr;  // delivers the payload, or runs the command
         std::uint32_t index = 0;
         std::uint32_t generation = 0;
@@ -229,7 +304,7 @@ private:
         std::tuple<Args&&...> args;
         std::promise<ActorRef<typename A::Message>> result;
 
-        static void run(Worker& worker, Envelope& envelope) {
+        static SendResult run(Worker& worker, Envelope& envelope) {
             const std::unique_ptr<SpawnRequest> request{payloadOf<SpawnRequest*>(envelope)};
             try {
                 request->result.set_value(std::apply(
@@ -238,6 +313,7 @@ private:
             } catch (...) {
                 request->result.set_exception(std::current_exception());
             }
+            return SendResult::Ok;
         }
     };
 
@@ -249,21 +325,25 @@ private:
     static constexpr std::size_t alignUp(std::size_t n, std::size_t align) noexcept {
         return (n + align - 1) / align * align;
     }
-    // Room an envelope with a T needs at the end of any batch.
+    // Room an envelope with a T needs at the end of any batch. T may be a pointer (a
+    // SpawnRequest travels as one), so sizeof(T) of a pointer is meant.
     template <class T>
     static constexpr std::size_t bytesFor() noexcept {
         return sizeof(Envelope) + (alignof(T) > alignof(Envelope) ? alignof(T) - alignof(Envelope) : 0) +
-               alignUp(sizeof(T), alignof(Envelope));
+               alignUp(sizeof(T), alignof(Envelope));  // NOLINT(bugprone-sizeof-expression)
     }
 
-    // Batches are raw storage: these are the only places that compute addresses in them.
-    static std::byte* at(Batch& batch, std::size_t offset) noexcept {
+    // Batches and segments are raw storage: these are the only places that compute addresses
+    // in them. Both keep their envelopes one header line past their start.
+    template <class Storage>
+    static std::byte* at(Storage& storage, std::size_t offset) noexcept {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast,cppcoreguidelines-pro-bounds-pointer-arithmetic)
-        return reinterpret_cast<std::byte*>(&batch) + kBatchHeader + offset;
+        return reinterpret_cast<std::byte*>(&storage) + kBatchHeader + offset;
     }
-    static Envelope& envelopeAt(Batch& batch, std::size_t offset) noexcept {
+    template <class Storage>
+    static Envelope& envelopeAt(Storage& storage, std::size_t offset) noexcept {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-        return *std::launder(reinterpret_cast<Envelope*>(at(batch, offset)));
+        return *std::launder(reinterpret_cast<Envelope*>(at(storage, offset)));
     }
     template <class T>
     static T& payloadOf(Envelope& envelope) noexcept {
@@ -271,17 +351,38 @@ private:
         return *std::launder(reinterpret_cast<T*>(reinterpret_cast<std::byte*>(&envelope) + envelope.payload));
     }
 
-    // Builds T(args...) and its envelope at the end of batch, which has bytesFor<T>() free.
+    // Builds T(args...) and its envelope at offset start of data, which has bytesFor<T>() free
+    // there, and returns where the next envelope goes.
     template <class T, class... Args>
-    static void append(Batch& batch, Envelope envelope, Args&&... args) {
-        const std::size_t start = batch.used;
+    static std::size_t write(std::byte* data, std::size_t start, Envelope envelope, Args&&... args) {
         const std::size_t payload = alignUp(start + sizeof(Envelope), alignof(T));
-        const std::size_t end = alignUp(payload + sizeof(T), alignof(Envelope));
-        ::new (static_cast<void*>(at(batch, payload))) T(std::forward<Args>(args)...);  // throws before any commit
+        const std::size_t end = alignUp(payload + sizeof(T), alignof(Envelope));  // NOLINT(bugprone-sizeof-expression)
+        // NOLINTBEGIN(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        ::new (static_cast<void*>(data + payload)) T(std::forward<Args>(args)...);  // throws before any commit
         envelope.size = static_cast<std::uint32_t>(end - start);
         envelope.payload = static_cast<std::uint32_t>(payload - start);
-        ::new (static_cast<void*>(at(batch, start))) Envelope{envelope};
-        batch.used = static_cast<std::uint32_t>(end);
+        ::new (static_cast<void*>(data + start)) Envelope{envelope};
+        // NOLINTEND(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        return end;
+    }
+
+    template <class T, class... Args>
+    static void append(Batch& batch, Envelope envelope, Args&&... args) {
+        batch.used =
+            static_cast<std::uint32_t>(write<T>(at(batch, 0), batch.used, envelope, std::forward<Args>(args)...));
+    }
+
+    // The calling thread's feed to this worker, opened on its first send; null when out of memory.
+    Feed* feedOfThisThread() noexcept {
+        FeedCache& cache = thread_feed_cache;
+        if (cache.system != system_) [[unlikely]] {
+            cache = feedsOfThisThread(*shared_);
+            if (cache.feeds == nullptr) return nullptr;
+        }
+        Feed*& feed = cache.feeds[id_];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        if (feed == nullptr) [[unlikely]]
+            feed = openFeed();
+        return feed;
     }
 
     // Any thread: a batch of its own with one envelope, pushed to this worker's inbox.
@@ -299,14 +400,18 @@ private:
         return SendResult::Ok;
     }
 
+    // Copies the payload into its mailbox. On Full the caller keeps the message, ahead of the
+    // ones after it, until the arena has room.
     template <Message Msg>
-    static void deliver(Worker& worker, Envelope& envelope) noexcept {
+    static SendResult deliver(Worker& worker, Envelope& envelope) noexcept {
         const ActorRef<Msg> local{envelope.index, envelope.generation};
-        if (worker.arena_.send(local, std::as_const(payloadOf<Msg>(envelope))) == SendResult::Ok) {
-            worker.schedule(local.index_);
-        } else {
-            worker.dropped_.store(worker.dropped_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-        }
+        const SendResult result = worker.arena_.send(local, std::as_const(payloadOf<Msg>(envelope)));
+        if (result == SendResult::Ok) worker.schedule(local.index_);
+        return result;
+    }
+
+    void countDropped() noexcept {
+        dropped_.store(dropped_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
 
     // Puts an actor with a new message in the ready queue, unless it is there already.
@@ -325,6 +430,14 @@ private:
     void flush() noexcept;
     void push(Batch* batch) noexcept;  // any thread
     void takeInbox() noexcept;
+    bool deliverPending() noexcept;  // false while the arena is full
+    void updatePressure() noexcept;
+    [[nodiscard]] bool pastHighMark() const noexcept;
+    Feed* openFeed() noexcept;                            // the sending thread
+    bool extend(Feed& feed, std::size_t bytes) noexcept;  // the sending thread
+    [[nodiscard]] std::uint64_t backlogOfThisThread() const noexcept;
+    void readFeeds(std::size_t budget) noexcept;
+    bool read(Feed& feed, std::size_t budget) noexcept;  // false while messages are left
     void idle() noexcept;
     [[nodiscard]] bool hasWork() const noexcept;
     Batch* takeBatch(std::size_t bytes) noexcept;
@@ -332,8 +445,9 @@ private:
     static Batch* newBatch(std::uint32_t capacity) noexcept;
     static void freeBatch(Batch* batch) noexcept;
 
-    std::uint32_t id_;
+    std::uint64_t system_;  // shared_->id, read on every send from outside
     Shared* shared_;
+    std::uint32_t id_;
     MailboxArena arena_;
     std::vector<Entry> entries_;        // by mailbox index
     std::vector<std::uint32_t> ready_;  // a ring of mailbox indices, sized to a power of two
@@ -343,13 +457,22 @@ private:
     std::vector<Batch*> outboxes_;      // by destination worker
     std::vector<std::uint32_t> dirty_;  // destinations with an outbox batch
     std::vector<Batch*> spare_;         // empty batches for the next outboxes
-    std::uint32_t turns_ = 0;           // since the last flush
+    Batch* pending_ = nullptr;          // taken from the inbox, not delivered yet; oldest first
+    std::uint32_t pending_offset_ = 0;  // of the next envelope in pending_
+    bool pressured_ = false;            // counted in shared_->pressured
+    std::size_t high_bytes_;            // arena bytes in use past which this worker is pressured
+    std::size_t low_bytes_;             // and below which it is not any more
+    Feed* feeds_ = nullptr;             // from the threads that send from outside, linked by next
+    std::int64_t spin_ns_;              // how long idle() spins before it sleeps; adapts
     std::atomic<std::uint64_t> dropped_{0};
+    std::uint32_t turns_ = 0;         // since the last flush
+    std::uint32_t unread_turns_ = 0;  // since feeds were last read
 
     // The fields other threads write, on a cache line of their own.
     static constexpr std::uint32_t kAwake = 0;
     static constexpr std::uint32_t kSleeping = 1;
     alignas(kChunkAlign) std::atomic<Batch*> inbox_{nullptr};  // newest first
+    std::atomic<Feed*> joining_{nullptr};                      // feeds opened since the last look
     std::atomic<std::uint32_t> sleep_{kAwake};
 };
 }  // namespace detail
@@ -385,8 +508,8 @@ protected:
     ~Actor() = default;
 
     // To any actor, on any worker. Full and DeadActor are only known for actors on this
-    // actor's worker: a message for another worker is dropped there if it cannot be
-    // delivered, and counted in VirtualWorker::droppedMessages.
+    // actor's worker. A message for another worker waits there while that worker's arena is
+    // full, and is dropped, and counted in VirtualWorker::droppedMessages, if the actor is gone.
     template <actorlib::Message To, class... Args>
         requires std::constructible_from<To, Args...>
     SendResult send(ActorRef<To> to, Args&&... args) {
@@ -451,8 +574,12 @@ public:
         return worker.spawnFromOutside<A>(std::forward<Args>(args)...);
     }
 
-    // From outside the actors, any thread. Ok means the actor's worker has the message; it
-    // drops it, and counts it in droppedMessages, if the actor is gone or its arena is full.
+    // From outside the actors, any thread. Ok means the actor's worker has the message: it
+    // drops it, and counts it in droppedMessages, if the actor is gone. Each thread's
+    // messages arrive in the order it sent them.
+    // Full means the workers are behind: while an arena is more than half full, workers
+    // stop taking messages from outside, and once 32 MiB of this thread's messages wait for
+    // the workers, its sends return Full until they catch up. Slow down and send again.
     template <Message Msg, class... Args>
         requires std::constructible_from<Msg, Args...>
     SendResult send(ActorRef<Msg> to, Args&&... args) {
