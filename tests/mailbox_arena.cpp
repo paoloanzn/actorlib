@@ -205,7 +205,7 @@ TEST_CASE("message slots honor the message's alignment") {
     MailboxArena arena;
     auto ref = arena.create<Wide>();
     for (std::uint64_t i = 0; i < 300; ++i) REQUIRE(arena.send(ref, Wide{i}) == SendResult::Ok);
-    CHECK(arena.chunksInUse() == 11);  // (960 - 32) / 32 = 29 per chunk
+    CHECK(arena.chunksInUse() == 12);  // 1 in 64 B, 9 in 320 B, then 29 per 960 B chunk: 1 + 9 + 10 x 29 = 300
 
     std::uint64_t expected = 0;
     const auto handled = arena.drain(ref, 1000, [&](Wide& w) {
@@ -317,6 +317,75 @@ TEST_CASE("destroying a parked mailbox returns its chunk") {
     REQUIRE(arena.send(reused, Ping{1}) == SendResult::Ok);
     REQUIRE(arena.drain(reused, 1, [](Ping&) {}) == 1);
     CHECK(arena.chunksInUse() == 1);
+}
+
+// Default classes are 64, 320 and 960 B, holding 14, 78 and 238 Pings.
+TEST_CASE("a busy mailbox's chunks grow one size class at a time") {
+    MailboxArena arena;
+    auto ref = arena.create<Ping>();
+    std::uint32_t sent = 0;
+    auto send_up_to = [&](std::uint32_t total) {
+        for (; sent < total; ++sent) REQUIRE(arena.send(ref, Ping{sent}) == SendResult::Ok);
+    };
+    send_up_to(14);
+    CHECK(arena.bytesInUse() == 64);
+    send_up_to(15);
+    CHECK(arena.bytesInUse() == 64 + 320);
+    send_up_to(14 + 78);
+    CHECK(arena.bytesInUse() == 64 + 320);
+    send_up_to(14 + 78 + 1);
+    CHECK(arena.bytesInUse() == 64 + 320 + 960);
+    send_up_to(14 + 78 + 238 + 1);
+    CHECK(arena.bytesInUse() == 64 + 320 + 960 + 960);  // the largest class repeats
+    CHECK(arena.pending(ref) == sent);
+
+    std::vector<std::uint32_t> seq;
+    CHECK(arena.drain(ref, 200, [&](Ping& p) { seq.push_back(p.seq); }) == 200);
+    CHECK(seq == sequence(200));
+    CHECK(arena.pending(ref) == sent - 200);
+    CHECK(arena.destroy(ref));
+    CHECK(arena.bytesInUse() == 0);
+}
+
+TEST_CASE("an emptied mailbox starts its next chunk one class below the last one it used") {
+    MailboxArena arena;
+    std::vector<ActorRef<Ping>> refs;
+    for (std::uint32_t i = 0; i <= MailboxArena::kParkingSpots; ++i) refs.push_back(arena.create<Ping>());
+    // Park another mailbox on the spot first, so the tested one gives its chunk back.
+    const auto holder = refs.front();
+    const auto ref = refs.back();
+    REQUIRE(arena.send(holder, Ping{0}) == SendResult::Ok);
+    REQUIRE(arena.drain(holder, 1, [](Ping&) {}) == 1);
+    CHECK(arena.bytesInUse() == 64);
+
+    for (std::uint32_t i = 0; i < 14 + 78 + 1; ++i) REQUIRE(arena.send(ref, Ping{i}) == SendResult::Ok);
+    CHECK(arena.bytesInUse() == 64 + 64 + 320 + 960);
+    CHECK(arena.drain(ref, 1000, [](Ping&) {}) == 14 + 78 + 1);
+    CHECK(arena.bytesInUse() == 64);
+
+    REQUIRE(arena.send(ref, Ping{0}) == SendResult::Ok);  // last used 960 B: start at 320 B
+    CHECK(arena.bytesInUse() == 64 + 320);
+    REQUIRE(arena.drain(ref, 1, [](Ping&) {}) == 1);
+    REQUIRE(arena.send(ref, Ping{1}) == SendResult::Ok);  // last used 320 B: start at 64 B
+    CHECK(arena.bytesInUse() == 64 + 64);
+    REQUIRE(arena.drain(ref, 1, [](Ping&) {}) == 1);
+    REQUIRE(arena.send(ref, Ping{2}) == SendResult::Ok);  // never below the smallest class
+    CHECK(arena.bytesInUse() == 64 + 64);
+}
+
+TEST_CASE("at max_bytes a mailbox takes a chunk of any class its message fits") {
+    // Classes 64 and 128 B, holding 14 and 30 Pings; 256 B at most.
+    MailboxArena arena{ArenaConfig{.chunk_size = 128, .initial_bytes = 128, .max_bytes = 256}};
+    auto ref = arena.create<Ping>();
+    for (std::uint32_t i = 0; i < 14 + 30 + 14; ++i) REQUIRE(arena.send(ref, Ping{i}) == SendResult::Ok);
+    CHECK(arena.bytesInUse() == 64 + 128 + 64);  // the third chunk wanted 128 B, but only 64 B was left
+    CHECK(arena.send(ref, Ping{0}) == SendResult::Full);
+    CHECK(arena.bytesReserved() == 256);
+    CHECK(arena.pending(ref) == 14 + 30 + 14);
+
+    std::vector<std::uint32_t> seq;
+    CHECK(arena.drain(ref, 100, [&](Ping& p) { seq.push_back(p.seq); }) == 14 + 30 + 14);
+    CHECK(seq == sequence(14 + 30 + 14));
 }
 
 TEST_CASE("invalid configurations and oversized messages are rejected") {
