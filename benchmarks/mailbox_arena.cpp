@@ -84,8 +84,8 @@ public:
 
     // Chunk memory only. Both backends leave out their per-mailbox struct (the arena's slot
     // table, the vector of deques).
-    [[nodiscard]] std::size_t liveBytes() const noexcept { return arena_.chunksInUse() * arena_.chunkSize(); }
-    [[nodiscard]] std::size_t reservedBytes() const noexcept { return arena_.chunksReserved() * arena_.chunkSize(); }
+    [[nodiscard]] std::size_t liveBytes() const noexcept { return arena_.bytesInUse(); }
+    [[nodiscard]] std::size_t reservedBytes() const noexcept { return arena_.bytesReserved(); }
 
 private:
     MailboxArena arena_;
@@ -231,8 +231,9 @@ void hotPath() {
 
 constexpr std::uint32_t kSpreadMessages = 1U << 16;
 constexpr std::array<std::uint32_t, 5> kSpreadMailboxes{1, 64, 1024, 16384, kSpreadMessages};
-// Odd numbers of cache lines (64, 320, 960, 4032) next to powers of two (1024, 4096):
-// power-of-two chunks map many mailboxes' write positions onto the same cache sets.
+// ArenaConfig::chunk_size, the largest size class; mailboxes start at 64 B and grow toward
+// it. Odd numbers of cache lines (64, 320, 960, 4032) next to powers of two (1024, 4096):
+// power-of-two chunks map many busy mailboxes' write positions onto the same cache sets.
 constexpr std::array<std::size_t, 6> kChunkSizes{64, 320, 960, 1024, 4032, 4096};
 
 // Enough room for one chunk per mailbox at the largest chunk size and mailbox count.
@@ -308,7 +309,7 @@ void manyMailboxes() {
         }
         for (const std::size_t chunk_size : kChunkSizes) {
             ArenaMailboxes<Ping> boxes{spreadConfig(chunk_size)};
-            const std::string name = "arena, " + std::to_string(chunk_size) + " B chunks";
+            const std::string name = "arena, chunks up to " + std::to_string(chunk_size) + " B";
             memory.push_back(spread(bench, name, boxes, mailboxes));
         }
     }
