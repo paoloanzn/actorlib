@@ -1,12 +1,19 @@
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <limits>
+#include <memory>
 #include <new>
 #include <stdexcept>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include <actorlib/actorlib.hpp>
+#include <actorlib/virtual_worker.hpp>
 
 namespace actorlib {
 namespace {
@@ -177,5 +184,284 @@ bool MailboxArena::grow(std::uint8_t cls) noexcept {
     pool.reserved += chunks;
     bytes_reserved_ += chunks * pool.size;
     return true;
+}
+
+// --- Runtime: workers and the VirtualWorker -------------------------------------------------
+
+namespace detail {
+namespace {
+constexpr std::uint32_t kFlushTurns = 16;  // a busy worker hands its outboxes over this often
+constexpr std::size_t kSpareBatches = 64;  // empty batches a worker keeps for its outboxes
+constexpr int kIdleSpins = 2000;           // inbox checks before an idle worker sleeps
+constexpr std::size_t kInitialReady = 64;
+
+void cpuRelax() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#else
+    std::this_thread::yield();
+#endif
+}
+}  // namespace
+
+void Shared::release() noexcept {
+    if (live.fetch_sub(1, std::memory_order_acq_rel) == 1 && started.load(std::memory_order_acquire)) finish();
+}
+
+void Shared::finish() noexcept {
+    done.store(true, std::memory_order_seq_cst);
+    done.notify_all();
+    for (const auto& worker : workers) worker->wake();
+}
+
+Worker::Worker(std::uint32_t id, Shared& shared, std::size_t workers, ArenaConfig config)
+    : id_{id}, shared_{&shared}, arena_{config}, ready_(kInitialReady), outboxes_(workers, nullptr) {
+    dirty_.reserve(workers);
+    spare_.reserve(kSpareBatches);
+}
+
+Worker::~Worker() {
+    stopAll();
+    for (Batch* batch : outboxes_) {
+        if (batch != nullptr) freeBatch(batch);
+    }
+    for (Batch* batch : spare_) freeBatch(batch);
+    for (Batch* batch = inbox_.exchange(nullptr, std::memory_order_acquire); batch != nullptr;) {
+        freeBatch(std::exchange(batch, batch->next));
+    }
+}
+
+// Each loop runs one turn: up to kBudget messages of the actor at the front of the queue.
+// Remote messages are taken in before every turn; outboxes go out every kFlushTurns turns
+// and whenever the queue runs dry, so messages never wait on a busy worker for long and an
+// idle one sends right away.
+void Worker::loop() {
+    while (!shared_->done.load(std::memory_order_acquire)) {
+        if (live_here_ != 0 && shared_->stopping.load(std::memory_order_relaxed)) [[unlikely]]
+            stopAll();
+        takeInbox();
+        if (ready_head_ == ready_tail_) {
+            flush();
+            idle();
+            continue;
+        }
+        runTurn(ready_[ready_head_++ & (ready_.size() - 1)]);
+        if (!dirty_.empty() && ++turns_ >= kFlushTurns) flush();
+    }
+}
+
+void Worker::runTurn(std::uint32_t slot) {
+    ActorBox* box = entries_[slot].box.get();
+    if (box == nullptr) {  // stopped while it waited in the queue
+        entries_[slot].queued = false;
+        return;
+    }
+    const Turn turn = box->run(*this);
+    Entry& entry = entries_[slot];  // spawns during the turn may have moved entries_
+    if (turn.stopped) {
+        entry.queued = false;
+        retire(slot);
+    } else if (turn.handled == kBudget) {
+        ready_[ready_tail_++ & (ready_.size() - 1)] = slot;  // may have more: back of the line
+    } else {
+        entry.queued = false;  // emptied; its next message queues it again
+    }
+}
+
+void Worker::retire(std::uint32_t slot) noexcept {
+    std::unique_ptr<ActorBox> box = std::move(entries_[slot].box);
+    box->destroyMailbox(arena_);
+    --live_here_;
+    box.reset();  // the actor's destructor runs here, on its own worker's thread
+    shared_->release();
+}
+
+void Worker::stopAll() noexcept {
+    // By index: a destructor may spawn, and entries_ grow.
+    for (std::uint32_t slot = 0; slot < entries_.size(); ++slot) {
+        if (entries_[slot].box != nullptr) retire(slot);
+    }
+}
+
+void Worker::reserve(std::uint32_t slot) {
+    if (slot > kSlotMask) throw std::length_error{"actorlib: too many actors on one worker"};
+    if (slot >= entries_.size()) entries_.resize(std::size_t{slot} + 1);
+    if (ready_.size() >= entries_.size()) return;
+    // Each mailbox is queued at most once, so a ring as large as entries_ never overflows.
+    std::vector<std::uint32_t> ring(std::bit_ceil(entries_.size()));
+    const std::uint32_t count = ready_tail_ - ready_head_;
+    for (std::uint32_t i = 0; i < count; ++i) ring[i] = ready_[(ready_head_ + i) & (ready_.size() - 1)];
+    ready_ = std::move(ring);
+    ready_head_ = 0;
+    ready_tail_ = count;
+}
+
+// A new outbox batch for worker, with `bytes` free; nullptr when out of memory. The full
+// one goes to its worker at once. A worker id and a byte count; the names say which.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+Worker::Batch* Worker::refill(std::uint32_t worker, std::size_t bytes) noexcept {
+    Batch*& batch = outboxes_[worker];
+    Batch* fresh = takeBatch(bytes);
+    if (fresh == nullptr) return nullptr;
+    if (batch != nullptr) {
+        shared_->workers[worker]->push(batch);
+    } else {
+        dirty_.push_back(worker);  // reserved for every worker: never allocates
+    }
+    batch = fresh;
+    return batch;
+}
+
+void Worker::flush() noexcept {
+    for (const std::uint32_t worker : dirty_) shared_->workers[worker]->push(std::exchange(outboxes_[worker], nullptr));
+    dirty_.clear();
+    turns_ = 0;
+}
+
+// Lock-free: other threads only ever add to the list, and the owner takes it whole.
+void Worker::push(Batch* batch) noexcept {
+    batch->next = inbox_.load(std::memory_order_relaxed);
+    while (!inbox_.compare_exchange_weak(batch->next, batch, std::memory_order_seq_cst, std::memory_order_relaxed)) {}
+    wake();
+}
+
+// Seen by a sleeper: either it sees the new batch (or flag) after announcing its sleep, or
+// the waker sees the announcement here. Both sides use seq_cst, so one of them always does.
+void Worker::wake() noexcept {
+    if (sleep_.load(std::memory_order_seq_cst) == kSleeping) {
+        sleep_.store(kAwake, std::memory_order_seq_cst);
+        sleep_.notify_one();
+    }
+}
+
+void Worker::takeInbox() noexcept {
+    if (inbox_.load(std::memory_order_relaxed) == nullptr) return;
+    // The list is newest first: reverse it so each sender's batches arrive in send order.
+    Batch* oldest = nullptr;
+    for (Batch* batch = inbox_.exchange(nullptr, std::memory_order_acquire); batch != nullptr;) {
+        Batch* next = batch->next;
+        batch->next = oldest;
+        oldest = std::exchange(batch, next);
+    }
+    while (oldest != nullptr) {
+        Batch* batch = std::exchange(oldest, oldest->next);
+        for (std::size_t offset = 0; offset < batch->used;) {
+            Envelope& envelope = envelopeAt(*batch, offset);
+            offset += envelope.size;
+            envelope.run(*this, envelope);
+        }
+        recycle(batch);
+    }
+}
+
+// Spins a little first: a reply often comes back within microseconds, and waking a
+// sleeping thread costs more than that.
+void Worker::idle() noexcept {
+    for (int spin = 0; spin < kIdleSpins; ++spin) {
+        if (hasWork()) return;
+        cpuRelax();
+    }
+    sleep_.store(kSleeping, std::memory_order_seq_cst);
+    if (hasWork()) {
+        sleep_.store(kAwake, std::memory_order_relaxed);
+        return;
+    }
+    sleep_.wait(kSleeping, std::memory_order_seq_cst);
+}
+
+bool Worker::hasWork() const noexcept {
+    return inbox_.load(std::memory_order_seq_cst) != nullptr || shared_->done.load(std::memory_order_seq_cst) ||
+           (live_here_ != 0 && shared_->stopping.load(std::memory_order_seq_cst));
+}
+
+Worker::Batch* Worker::takeBatch(std::size_t bytes) noexcept {
+    if (bytes <= kBatchBytes && !spare_.empty()) {
+        Batch* batch = spare_.back();
+        spare_.pop_back();
+        return batch;
+    }
+    return newBatch(static_cast<std::uint32_t>(std::max<std::size_t>(bytes, kBatchBytes)));
+}
+
+// Batches come back to whichever worker received them, which keeps them for its own outboxes.
+void Worker::recycle(Batch* batch) noexcept {
+    if (batch->capacity != kBatchBytes || spare_.size() == kSpareBatches) {
+        freeBatch(batch);
+        return;
+    }
+    batch->used = 0;
+    batch->next = nullptr;
+    spare_.push_back(batch);  // reserved: never allocates
+}
+
+Worker::Batch* Worker::newBatch(std::uint32_t capacity) noexcept {
+    void* memory = ::operator new(kBatchHeader + capacity, std::align_val_t{kChunkAlign}, std::nothrow);
+    if (memory == nullptr) return nullptr;
+    // Raw storage owned by whichever outbox, inbox or spare list holds it; freeBatch releases it.
+    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+    return ::new (memory) Batch{.next = nullptr, .used = 0, .capacity = capacity};
+}
+
+void Worker::freeBatch(Batch* batch) noexcept { ::operator delete(batch, std::align_val_t{kChunkAlign}); }
+}  // namespace detail
+
+VirtualWorker::VirtualWorker(VirtualWorkerConfig config) {
+    const std::size_t workers = std::max<std::size_t>(
+        config.workers != 0 ? config.workers : std::size_t{std::thread::hardware_concurrency()}, 1);
+    if (workers > detail::Worker::kMaxWorkers) throw std::invalid_argument{"actorlib: at most 256 workers"};
+    shared_.workers.reserve(workers);
+    for (std::uint32_t id = 0; id < workers; ++id) {
+        shared_.workers.push_back(std::make_unique<detail::Worker>(id, shared_, workers, config.arena));
+    }
+}
+
+VirtualWorker::~VirtualWorker() {
+    if (shared_.started.load(std::memory_order_acquire)) {
+        stop();
+        try {
+            join();
+        } catch (...) {
+            std::terminate();  // only if a worker thread cannot be joined: nothing left to recover
+        }
+    }
+    // Before any worker goes: an actor's destructor may still send to the others.
+    for (const auto& worker : shared_.workers) worker->stopAll();
+}
+
+void VirtualWorker::start() {
+    if (shared_.started.exchange(true, std::memory_order_acq_rel)) {
+        throw std::logic_error{"actorlib: start() called twice"};
+    }
+    if (shared_.live.load(std::memory_order_acquire) == 0) shared_.finish();
+    try {
+        threads_.reserve(shared_.workers.size());
+        for (const auto& worker : shared_.workers) threads_.emplace_back([w = worker.get()] { w->loop(); });
+    } catch (...) {
+        shared_.finish();  // the workers that did start exit
+        for (std::thread& thread : threads_) thread.join();
+        threads_.clear();
+        throw;
+    }
+}
+
+void VirtualWorker::join() {
+    if (!shared_.started.load(std::memory_order_acquire)) throw std::logic_error{"actorlib: join() before start()"};
+    shared_.done.wait(false, std::memory_order_acquire);
+    for (std::thread& thread : threads_) {
+        if (thread.joinable()) thread.join();
+    }
+}
+
+void VirtualWorker::stop() noexcept {
+    shared_.stopping.store(true, std::memory_order_seq_cst);
+    for (const auto& worker : shared_.workers) worker->wake();
+}
+
+std::uint64_t VirtualWorker::droppedMessages() const noexcept {
+    std::uint64_t dropped = 0;
+    for (const auto& worker : shared_.workers) dropped += worker->dropped();
+    return dropped;
 }
 }  // namespace actorlib

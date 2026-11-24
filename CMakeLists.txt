@@ -16,8 +16,11 @@ if(ACTORLIB_CLANG_TIDY)
     set(CMAKE_CXX_CLANG_TIDY "${ACTORLIB_CLANG_TIDY_EXE}")
 endif()
 
+find_package(Threads REQUIRED)
+
 add_library(actorlib src/actorlib.cpp)
 add_library(actorlib::actorlib ALIAS actorlib)
+target_link_libraries(actorlib PUBLIC Threads::Threads)
 
 target_compile_features(actorlib PUBLIC cxx_std_20)
 set_target_properties(actorlib PROPERTIES CXX_EXTENSIONS OFF)

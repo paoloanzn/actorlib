@@ -42,6 +42,10 @@ enum class SendResult : std::uint8_t {
     DeadActor,  // the mailbox was destroyed, or the ref is null
 };
 
+namespace detail {
+class Worker;
+}  // namespace detail
+
 // Typed handle to a mailbox. The generation makes refs to destroyed mailboxes fail
 // instead of reaching whichever mailbox reused the slot.
 template <Message Msg>
@@ -52,7 +56,8 @@ public:
 
 private:
     friend class MailboxArena;
-    // Private and called only by MailboxArena, so the two ids cannot be swapped by users.
+    friend class detail::Worker;  // the runtime (virtual_worker.hpp) keeps the worker id in index_'s top bits
+    // Private and called only by MailboxArena and the runtime, so the two ids cannot be swapped by users.
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     ActorRef(std::uint32_t index, std::uint32_t generation) noexcept : index_{index}, generation_{generation} {}
 
@@ -409,15 +414,5 @@ private:
         spots.fill(kNoSlot);
         return spots;
     }
-};
-
-class Actor {
-public:
-    explicit Actor(int id) : id_{id} {}
-
-    [[nodiscard]] int id() const noexcept { return id_; }
-
-private:
-    int id_;
 };
 }  // namespace actorlib
