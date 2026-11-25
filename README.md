@@ -92,8 +92,8 @@ Add actorlib to your `CMakeLists.txt`:
 ```cmake
 include(FetchContent)
 FetchContent_Declare(actorlib
-    URL https://codeload.github.com/paoloanzn/actorlib/zip/refs/tags/v0.1.0
-    URL_HASH SHA256=<release-archive-sha256>
+    URL https://codeload.github.com/paoloanzn/actorlib/zip/refs/tags/v0.1.0-alpha
+    URL_HASH SHA256=6dc7d47c4243f5178e2656519673938dc4be6838417d3a0474597a2135acd779
 )
 FetchContent_MakeAvailable(actorlib)
 target_link_libraries(my_app PRIVATE actorlib::actorlib)
