@@ -1,0 +1,91 @@
+# Publishes the GitHub release of each pushed tag vX.Y.Z, or vX.Y.Z-suffix as a pre-release.
+# release.sh pushes the tags. The tag must match project(VERSION) in CMakeLists.txt, and CI
+# must pass on the tagged commit. The release notes start with the FetchContent block for
+# the tag, with the SHA-256 of its source archive.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Check version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Match the tag against the project version
+        id: version
+        run: |
+          version=$(sed -n 's/^project(actorlib VERSION \([0-9][0-9.]*\).*/\1/p' CMakeLists.txt)
+          if [ -z "$version" ]; then
+            echo "::error file=CMakeLists.txt::no project(actorlib VERSION ...) found"
+            exit 1
+          fi
+          case "$GITHUB_REF_NAME" in
+            "v$version") prerelease=false ;;
+            "v$version"-*) prerelease=true ;;
+            *)
+              echo "::error::tag $GITHUB_REF_NAME does not match the project version: expected v$version or v$version-<suffix>"
+              exit 1
+              ;;
+          esac
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "actorlib $version (tag: $GITHUB_REF_NAME, pre-release: $prerelease)"
+
+  ci:
+    name: CI
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish release
+    needs: [version, ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # The archive FetchContent downloads, so its hash is the one users need.
+      - name: Write the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          url="https://codeload.github.com/${GITHUB_REPOSITORY}/zip/refs/tags/${GITHUB_REF_NAME}"
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -o source.zip "$url"
+          sha256=$(sha256sum source.zip | cut -d ' ' -f 1)
+          {
+            echo '```cmake'
+            echo 'include(FetchContent)'
+            echo 'FetchContent_Declare(actorlib'
+            echo "    URL ${url}"
+            echo "    URL_HASH SHA256=${sha256}"
+            echo ')'
+            echo 'FetchContent_MakeAvailable(actorlib)'
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          flags=()
+          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md --generate-notes "${flags[@]}"

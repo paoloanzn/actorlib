@@ -1,0 +1,114 @@
+# Format check, clang-tidy lint, warning-free builds and tests with GCC and Clang on x86_64
+# and arm64, and the tests under AddressSanitizer and UndefinedBehaviorSanitizer. Runs on
+# every push to main and every pull request. The release workflow also calls it, so a
+# release is published only when CI passes on the tagged commit.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # Pinned: different clang-format versions format the same code differently.
+      - name: Install clang-format
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang-format-18
+
+      - name: Check formatting
+        run: git ls-files '*.cpp' '*.hpp' | xargs clang-format-18 --dry-run --Werror
+
+  lint:
+    name: Lint (clang-tidy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install clang and clang-tidy
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang-18 clang-tidy-18
+
+      # .clang-tidy makes every finding an error, so the build fails on any of them.
+      - name: Build with clang-tidy
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DACTORLIB_CLANG_TIDY=ON -DACTORLIB_BUILD_BENCHMARKS=ON
+          cmake --build build --parallel 4
+
+  test:
+    name: Test (${{ matrix.compiler }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        compiler: [gcc, clang]
+        include:
+          - compiler: gcc
+            cxx: g++
+            packages: g++
+          - compiler: clang
+            cxx: clang++-18
+            packages: clang-18
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install compiler
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake ${{ matrix.packages }}
+
+      # The benchmarks are built too, so they keep compiling; CI does not run them.
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            "-DCMAKE_CXX_FLAGS=-Wall -Wextra -Wpedantic -Werror" -DACTORLIB_BUILD_BENCHMARKS=ON
+          cmake --build build --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: Test (ASan + UBSan)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=g++ \
+            "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
+          cmake --build build --parallel 4
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure

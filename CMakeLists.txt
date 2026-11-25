@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(actorlib LANGUAGES CXX)
+project(actorlib VERSION 0.1.0 LANGUAGES CXX)
 
 option(ACTORLIB_CLANG_TIDY "Run clang-tidy (.clang-tidy) on every compiled source" OFF)
 option(ACTORLIB_BUILD_BENCHMARKS "Build the nanobench benchmarks in benchmarks/" OFF)
