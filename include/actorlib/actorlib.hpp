@@ -19,8 +19,8 @@ inline constexpr std::size_t kChunkAlign = 64;
 
 // The largest chunk: 15 cache lines. Chunks are laid out back to back, so a power-of-two
 // size puts the same offset of every chunk on a handful of cache sets: with many active
-// mailboxes, 1024- and 4096-byte chunks measured 2-5x slower than 960 and 4032 (see
-// benchmarks/).
+// mailboxes, 1024- and 4096-byte chunks measured 2-5x slower than 960 and 4032 (commit
+// aacd100).
 inline constexpr std::size_t kDefaultChunkSize = 960;
 inline constexpr std::size_t kDefaultInitialBytes = std::size_t{1} << 20;  // 1 MiB
 inline constexpr std::size_t kDefaultMaxBytes = std::size_t{64} << 20;     // 64 MiB

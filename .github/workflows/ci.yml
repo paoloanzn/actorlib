@@ -81,7 +81,7 @@ jobs:
       - name: Install compiler
         run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake ${{ matrix.packages }}
 
-      # The benchmarks are built too, so they keep compiling; CI does not run them.
+      # The benchmarks are built too, so they keep compiling.
       - name: Build
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
@@ -90,6 +90,11 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+      # Every benchmark scenario once, at a tiny size, so they keep running. CI does not time
+      # them: shared runners are too noisy. benchmarks/bench.sh compares timings on one machine.
+      - name: Benchmarks (smoke)
+        run: build/benchmarks/actorlib_benchmarks --smoke
 
   sanitizers:
     name: Test (ASan + UBSan)
