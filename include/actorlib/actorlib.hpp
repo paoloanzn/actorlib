@@ -406,8 +406,14 @@ private:
     std::size_t bytes_reserved_ = 0;
     std::byte* slabs_ = nullptr;  // intrusive list, freed in the destructor
     std::uint32_t free_slots_ = kNoSlot;
+    // Where this arena's generations start, far from every other arena's: a ref made by another
+    // arena (another VirtualWorker, or a standalone arena) fails isValid like a stale ref,
+    // instead of reaching a mailbox of this arena, which may hold another message type. It sits
+    // in the padding before slots_, so the arena keeps its size and layout.
+    std::uint32_t first_generation_ = nextFirstGeneration();
     std::vector<MailboxSlot> slots_;
     std::array<std::uint32_t, kParkingSpots> parking_ = filledParking();
+    static std::uint32_t nextFirstGeneration() noexcept;
 
     static constexpr std::array<std::uint32_t, kParkingSpots> filledParking() noexcept {
         std::array<std::uint32_t, kParkingSpots> spots{};

@@ -153,7 +153,9 @@ one message type. A `std::variant` of message structs carries several kinds.
 An **`ActorRef<M>`** is the typed address of an actor: sending the wrong message type fails
 to compile. A ref packs the actor's worker, its mailbox slot and a generation. When an
 actor stops, its slot's generation changes, so an old ref fails with `DeadActor` and never
-reaches a newer actor that reuses the slot. A default-constructed ref is null.
+reaches a newer actor that reuses the slot. Each arena starts its generations at a different
+value, so a ref used with another `VirtualWorker` fails the same way. A default-constructed
+ref is null.
 
 Every send returns a `SendResult`:
 

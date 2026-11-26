@@ -197,6 +197,60 @@ TEST_CASE("messages between workers wait for room in a full arena instead of bei
     CHECK(totals.out_of_order.load() == 0);
 }
 
+// A ref works only with the VirtualWorker that made it. Used with another one, it must fail
+// like a ref to a stopped actor, not reach whichever actor sits in the same mailbox slot
+// there: that actor may take another message type, and a message of the wrong size written
+// into its mailbox corrupts memory.
+TEST_CASE("a ref from another VirtualWorker reaches no actor of this one") {
+    struct Big {
+        std::array<std::uint64_t, 100> words;  // NOLINT(readability-magic-numbers)
+    };
+    class BigSink : public Actor<Big> {
+    public:
+        void onMessage(const Big& /*big*/) {}
+    };
+    class Counter : public Actor<Item> {
+    public:
+        explicit Counter(std::atomic<std::uint64_t>* received) : received_{received} {}
+        void onMessage(const Item& item) {
+            if (item.end) {
+                stop();
+                return;
+            }
+            received_->fetch_add(1, std::memory_order_relaxed);
+        }
+
+    private:
+        std::atomic<std::uint64_t>* received_;
+    };
+
+    constexpr std::uint64_t kSends = 100;
+    std::atomic<std::uint64_t> received{0};
+    std::atomic<std::uint64_t> unused{0};
+    VirtualWorker other{VirtualWorkerConfig{.workers = 1}};  // never started
+    const auto foreign_item = other.addActor<Counter>(&unused);
+    const auto foreign_big = other.addActor<BigSink>();
+    // Actors in the same worker and mailbox slots as the foreign refs: the first takes the same
+    // message type as its foreign twin, the second a far smaller one than its twin.
+    VirtualWorker system{VirtualWorkerConfig{.workers = 1}};
+    const auto first = system.addActor<Counter>(&received);
+    const auto second = system.addActor<Counter>(&received);
+    system.start();
+
+    for (std::uint64_t i = 0; i < kSends; ++i) {
+        CHECK(sendPatiently(system, foreign_item, Item{.seq = i, .end = false}) ==
+              SendResult::Ok);  // Ok: the worker has it
+        CHECK(sendPatiently(system, foreign_big, Big{}) == SendResult::Ok);
+    }
+    // This thread's messages arrive in order, so the foreign ones are all handled before these.
+    CHECK(sendPatiently(system, first, Item{.seq = 0, .end = true}) == SendResult::Ok);
+    CHECK(sendPatiently(system, second, Item{.seq = 0, .end = true}) == SendResult::Ok);
+    system.join();
+
+    CHECK(received.load() == 0);
+    CHECK(system.droppedMessages() == 2 * kSends);
+}
+
 // Each sending thread's messages arrive in the order it sent them, whatever the other
 // threads do, and they still arrive when the thread has already exited (its feed outlives
 // it until the worker has read everything in it).

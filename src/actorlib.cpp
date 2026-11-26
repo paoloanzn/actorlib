@@ -29,7 +29,16 @@ namespace {
 // Each slab starts with a cache-line-sized header holding the next-slab link, so the
 // chunks after it stay aligned.
 constexpr std::size_t kSlabHeaderSize = kChunkAlign;
+
+// Even, since a slot's generation is even while it is dead, and 2^32 divided by the golden
+// ratio, so the start points of any few arenas lie far apart.
+constexpr std::uint32_t kGenerationStride = 0x9E3779B8;
+std::atomic<std::uint32_t> next_first_generation{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 }  // namespace
+
+std::uint32_t MailboxArena::nextFirstGeneration() noexcept {
+    return next_first_generation.fetch_add(kGenerationStride, std::memory_order_relaxed);
+}
 
 MailboxArena::MailboxArena(ArenaConfig config) {
     if (config.chunk_size < kChunkAlign || config.chunk_size % kChunkAlign != 0 ||
@@ -93,7 +102,7 @@ std::uint32_t MailboxArena::createSlot(std::size_t data_offset, std::size_t msg_
     } else {
         if (slots_.size() >= kNoSlot) throw std::length_error{"actorlib: too many mailboxes"};
         index = static_cast<std::uint32_t>(slots_.size());
-        slots_.emplace_back();
+        slots_.emplace_back().generation = first_generation_;
     }
     MailboxSlot& slot = slots_[index];
     std::uint8_t min_class = 0;
@@ -115,7 +124,8 @@ bool MailboxArena::destroySlot(std::uint32_t index, std::uint32_t generation) no
         chunk = next;
     }
     parkEmpty(slot);
-    ++slot.generation;  // odd -> even; after 2^31 reuses of one slot a stale ref could match again
+    ++slot.generation;  // odd -> even; after 2^31 reuses of one slot a stale ref could match again,
+                        // and after millions a ref made by another arena could
     slot.next_free = free_slots_;
     free_slots_ = index;
     return true;
