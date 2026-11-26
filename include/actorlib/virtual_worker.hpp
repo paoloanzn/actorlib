@@ -89,8 +89,8 @@ FeedCache feedsOfThisThread(const Shared& shared) noexcept;  // fills thread_fee
 
 // Whether senders from outside skip the store-load fence before checking that a worker
 // sleeps. A sleeping worker cannot miss their messages anyway: before it sleeps, it makes
-// every running thread of the process execute a full fence (Linux membarrier). Set once,
-// before the first worker starts, and never changed after.
+// every thread that skips it execute a full fence (membarrier on Linux; on macOS, it
+// interrupts each of them). Set once, before the first worker starts, and never changed after.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 inline constinit std::atomic<bool> asymmetric_fences{false};
 void releaseFeed(Feed* feed) noexcept;  // by one of its two owners

@@ -22,6 +22,13 @@
 
 #include <sys/syscall.h>
 #include <unistd.h>
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <os/lock.h>
+
+#include <pthread.h>
+
+#include <array>
 #endif
 
 namespace actorlib {
@@ -319,6 +326,52 @@ void pause() noexcept {
     for (int i = 0; i < kPausesPerCheck; ++i) cpuRelax();
 }
 
+#if defined(__APPLE__)
+// macOS has no membarrier. Reading another thread's registers does the same for that one
+// thread: the kernel interrupts it and waits until it has left its core, and leaving the core
+// runs a full fence (.NET and Wine flush write buffers this way). It costs about a microsecond
+// per thread, so heavyFence interrupts only the threads that skip the store-load fence: the
+// workers (credit) and the outside threads with a feed (postMessage).
+
+// A thread heavyFence interrupts. The node lives in the thread's own storage, so joining
+// never allocates. It leaves when the thread ends, after the thread's last send.
+struct FencedThread {
+    thread_act_t port = MACH_PORT_NULL;  // until the thread joins
+    FencedThread* prev = nullptr;
+    FencedThread* next = nullptr;
+
+    FencedThread() = default;
+    FencedThread(const FencedThread&) = delete;
+    FencedThread& operator=(const FencedThread&) = delete;
+    FencedThread(FencedThread&&) = delete;
+    FencedThread& operator=(FencedThread&&) = delete;
+    ~FencedThread();
+};
+
+// NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
+// Held while a thread joins or leaves, and through each heavyFence: a thread that joins after
+// a fence sees everything the fence's caller wrote before it.
+os_unfair_lock fenced_lock = OS_UNFAIR_LOCK_INIT;
+FencedThread* fenced_threads = nullptr;
+thread_local FencedThread fenced_this_thread;
+// NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
+
+FencedThread::~FencedThread() {
+    if (port == MACH_PORT_NULL) return;
+    os_unfair_lock_lock(&fenced_lock);
+    (prev != nullptr ? prev->next : fenced_threads) = next;
+    if (next != nullptr) next->prev = prev;
+    os_unfair_lock_unlock(&fenced_lock);
+}
+
+// Stops thread until it has left its core, then lets it go on.
+kern_return_t interrupt(thread_act_t thread) noexcept {
+    std::array<natural_t, MACHINE_THREAD_STATE_COUNT> state{};
+    mach_msg_type_number_t count = state.size();
+    return thread_get_state(thread, MACHINE_THREAD_STATE, state.data(), &count);
+}
+#endif
+
 // Lets this process use heavyFence; false where the system cannot.
 bool registerHeavyFence() noexcept {
 #if defined(__linux__)
@@ -327,16 +380,52 @@ bool registerHeavyFence() noexcept {
     return commands > 0 && (commands & MEMBARRIER_CMD_PRIVATE_EXPEDITED) != 0 &&
            syscall(SYS_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0) == 0;
     // NOLINTEND(cppcoreguidelines-pro-type-vararg)
+#elif defined(__APPLE__)
+    return interrupt(pthread_mach_thread_np(pthread_self())) == KERN_SUCCESS;  // false if not allowed
 #else
     return false;
 #endif
 }
 
-// A full fence on every running thread of the process, this one included. Costs a few
-// microseconds, so only a worker about to sleep pays it.
-void heavyFence() noexcept {
+// Makes heavyFence cover the calling thread. Called before the thread first skips a
+// store-load fence, and before it first touches thread_feeds: thread_locals end in reverse
+// order, so the thread leaves only after its last send. Linux covers every thread anyway.
+void joinHeavyFence() noexcept {
+#if defined(__APPLE__)
+    FencedThread& self = fenced_this_thread;
+    if (self.port != MACH_PORT_NULL) return;
+    os_unfair_lock_lock(&fenced_lock);
+    self.port = pthread_mach_thread_np(pthread_self());
+    self.next = fenced_threads;
+    if (fenced_threads != nullptr) fenced_threads->prev = &self;
+    fenced_threads = &self;
+    os_unfair_lock_unlock(&fenced_lock);
+#endif
+}
+
+// A full fence on every thread that skips the store-load fence, this one included. Costs a
+// few microseconds, so only a worker about to sleep pays it. False if some thread may not
+// have fenced: the caller must not sleep then.
+bool heavyFence() noexcept {
 #if defined(__linux__)
-    syscall(SYS_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0);  // NOLINT(cppcoreguidelines-pro-type-vararg)
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
+    return syscall(SYS_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) == 0;
+#elif defined(__APPLE__)
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const thread_act_t self = pthread_mach_thread_np(pthread_self());
+    bool fenced = true;
+    os_unfair_lock_lock(&fenced_lock);
+    for (const FencedThread* thread = fenced_threads; thread != nullptr; thread = thread->next) {
+        if (thread->port == self) continue;
+        kern_return_t result = interrupt(thread->port);
+        while (result == KERN_ABORTED) result = interrupt(thread->port);  // our wait was cut short
+        fenced = fenced && result == KERN_SUCCESS;
+    }
+    os_unfair_lock_unlock(&fenced_lock);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    return fenced;
+#else
+    return false;
 #endif
 }
 }  // namespace
@@ -347,6 +436,7 @@ void Shared::release() noexcept {
 
 FeedCache feedsOfThisThread(const Shared& shared) noexcept {
     if (thread_feeds_ended) return {};
+    joinHeavyFence();  // postMessage skips the store-load fence
     std::vector<ThreadFeeds::System>& systems = thread_feeds.systems;
     for (ThreadFeeds::System& system : systems) {
         if (system.id == shared.id) return {.system = system.id, .feeds = system.feeds.data()};
@@ -422,6 +512,7 @@ Worker::~Worker() {
 // on a busy worker for long, an idle one sends and receives right away, and a turn costs
 // no more for them.
 void Worker::loop() {
+    joinHeavyFence();  // credit skips the store-load fence
     while (!shared_->done.load(std::memory_order_acquire)) {
         if (live_here_ != 0 && shared_->stopping.load(std::memory_order_relaxed)) [[unlikely]]
             stopAll();
@@ -830,8 +921,8 @@ void Worker::idle() noexcept {
     if (ask) [[unlikely]]
         askForCredit(true);
     sleep_.store(kSleeping, std::memory_order_seq_cst);
-    if (asymmetric_fences.load(std::memory_order_relaxed)) heavyFence();  // pairs with postMessage and credit
-    if (hasWork()) {
+    // Pairs with postMessage and credit. Without the fence a send could go unseen: spin again.
+    if ((asymmetric_fences.load(std::memory_order_relaxed) && !heavyFence()) || hasWork()) {
         sleep_.store(kAwake, std::memory_order_relaxed);
         if (ask) [[unlikely]]
             askForCredit(false);

@@ -277,9 +277,11 @@ have no order between them. This is what makes an end-of-stream message safe: it
 the last message its receiver gets from that sender.
 
 **Waking.** Handing over a batch, or writing to a feed, wakes the target's worker if it
-sleeps. On Linux, sends from outside skip the full memory fence this would need: a worker
-about to sleep makes every thread of the process run one instead (the `membarrier` system
-call). On other systems, each send from outside runs the fence itself.
+sleeps. On Linux and macOS, sends from outside skip the full memory fence this would need:
+a worker about to sleep makes the sending threads run one instead. Linux has the `membarrier`
+system call for this. On macOS, the worker reads each sending thread's registers, which makes
+the kernel interrupt that thread. On other systems, each send from outside runs the fence
+itself.
 
 #### Backpressure
 
