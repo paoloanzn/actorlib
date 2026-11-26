@@ -327,7 +327,6 @@ private:
         // its worker is past the transit pause mark (see refill).
         std::uint32_t limit = 0;
         std::uint32_t from = kNone;  // the sending worker, credited once the batch is delivered
-        bool wake_sender = false;    // the sender has actors paused until it is credited
     };
 
     // Transit to one other worker, counted like a feed: the sender adds the capacity of every
@@ -338,6 +337,7 @@ private:
     };
     struct alignas(kChunkAlign) Credit {
         std::atomic<std::uint64_t> delivered{0};  // written by the receiving worker only
+        std::atomic<bool> wake{false};            // set by the sender while it sleeps with paused actors
     };
     static constexpr std::size_t kBatchHeader = kChunkAlign;  // keeps the envelopes 64-byte aligned
     static constexpr std::uint32_t kBatchBytes = 4096 - kBatchHeader;
@@ -488,6 +488,7 @@ private:
     void pauseActor(std::uint32_t slot) noexcept;
     void resumePaused(bool all) noexcept;
     [[nodiscard]] bool canResume() const noexcept;
+    void askForCredit(bool ask) noexcept;
     void flush() noexcept;
     void push(Batch* batch) noexcept;  // any thread
     void takeInbox() noexcept;

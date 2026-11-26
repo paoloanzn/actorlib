@@ -527,7 +527,6 @@ Worker::Batch* Worker::refill(std::uint32_t worker, std::size_t bytes) noexcept 
         batch = fresh;
     }
     batch->limit = over ? 0 : batch->capacity;
-    batch->wake_sender = batch->wake_sender || over;
     return batch;
 }
 
@@ -537,18 +536,24 @@ std::uint64_t Worker::creditFrom(std::uint32_t worker, std::memory_order order) 
 }
 
 // This worker has delivered every message of batch into its arena: the sender may send that
-// much more. Only this worker writes the counter, so a plain store does.
+// much more. Only this worker writes the counter, so a plain store does. A sender about to
+// sleep with paused actors sees the credit, or this sees its wake flag (see idle). As for
+// feeds, the store-load fence is skipped when the sender fences for both before it sleeps.
 void Worker::credit(const Batch& batch) noexcept {
     if (batch.from == kNone) return;  // an addActor request from another thread
-    std::atomic<std::uint64_t>& delivered = credits_[batch.from].delivered;
-    const std::uint64_t value = delivered.load(std::memory_order_relaxed) + batch.capacity;
-    if (!batch.wake_sender) [[likely]] {
-        delivered.store(value, std::memory_order_relaxed);
-        return;
+    Credit& credit = credits_[batch.from];
+    const std::uint64_t value = credit.delivered.load(std::memory_order_relaxed) + batch.capacity;
+    bool wake = false;
+    if (asymmetric_fences.load(std::memory_order_relaxed)) [[likely]] {
+        credit.delivered.store(value, std::memory_order_relaxed);
+        std::atomic_signal_fence(std::memory_order_seq_cst);  // keeps the compiler from swapping the two
+        wake = credit.wake.load(std::memory_order_relaxed);
+    } else {
+        credit.delivered.store(value, std::memory_order_seq_cst);
+        wake = credit.wake.load(std::memory_order_seq_cst);
     }
-    // A sender about to sleep sees the credit, or this sees it sleeping (see idle).
-    delivered.store(value, std::memory_order_seq_cst);
-    shared_->workers[batch.from]->wake();
+    if (wake) [[unlikely]]
+        shared_->workers[batch.from]->wake();
 }
 
 bool Worker::pastResumeMark(std::uint32_t worker) noexcept {
@@ -587,6 +592,20 @@ void Worker::resumePaused(bool all) noexcept {
     }
     paused_head_ = paused_tail_ = kNone;
     paused_ = 0;
+}
+
+// Before this worker sleeps with paused actors (ask), it has every worker they wait for wake
+// it with its next credit, and after it wakes (!ask) it stops them. Only workers past the
+// resume mark matter: credit from any other one cannot let them run.
+void Worker::askForCredit(bool ask) noexcept {
+    for (std::uint32_t worker = 0; worker < transit_.size(); ++worker) {
+        std::atomic<bool>& wake = shared_->workers[worker]->credits_[id_].wake;
+        if (ask ? transit_[worker].sent - transit_[worker].seen <= resume_mark_
+                : !wake.load(std::memory_order_relaxed)) {
+            continue;
+        }
+        wake.store(ask, std::memory_order_seq_cst);
+    }
 }
 
 // Whether the paused actors may run again: idle() asks before it sleeps.
@@ -805,13 +824,22 @@ void Worker::idle() noexcept {
         pause();
         if (spin % kChecksPerClock == 0 && nanosSince(start) >= spin_ns_) break;
     }
+    // Otherwise the credit that lets the paused actors run could find this worker asleep, and
+    // leave it there.
+    const bool ask = paused_ != 0;
+    if (ask) [[unlikely]]
+        askForCredit(true);
     sleep_.store(kSleeping, std::memory_order_seq_cst);
-    if (asymmetric_fences.load(std::memory_order_relaxed)) heavyFence();  // pairs with postMessage
+    if (asymmetric_fences.load(std::memory_order_relaxed)) heavyFence();  // pairs with postMessage and credit
     if (hasWork()) {
         sleep_.store(kAwake, std::memory_order_relaxed);
+        if (ask) [[unlikely]]
+            askForCredit(false);
         return;
     }
     sleep_.wait(kSleeping, std::memory_order_seq_cst);
+    if (ask) [[unlikely]]
+        askForCredit(false);
     const std::int64_t gap = nanosSince(start);
     spin_ns_ = gap > kMaxSpinNs ? std::max(kMinSpinNs, spin_ns_ / 2) : std::min(kMaxSpinNs, 2 * gap);
 }
@@ -854,7 +882,6 @@ void Worker::recycle(Batch* batch) noexcept {
     batch->next = nullptr;
     batch->limit = 0;
     batch->from = kNone;
-    batch->wake_sender = false;
     spare_.push_back(batch);  // reserved: never allocates
 }
 
