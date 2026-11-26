@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <exception>
 #include <future>
+#include <limits>
 #include <memory>
 #include <new>
 #include <stdexcept>
@@ -94,6 +95,32 @@ FeedCache feedsOfThisThread(const Shared& shared) noexcept;  // fills thread_fee
 inline constinit std::atomic<bool> asymmetric_fences{false};
 void releaseFeed(Feed* feed) noexcept;  // by one of its two owners
 
+// Allocates whole cache lines. A worker's vectors are small and written on every turn: on a
+// line shared with another worker's data, each write would take the line from that worker.
+template <class T>
+struct LineAllocator {
+    using value_type = T;
+    LineAllocator() = default;
+    template <class U>
+    LineAllocator(const LineAllocator<U>& /*other*/) noexcept {}  // NOLINT(google-explicit-constructor)
+    // T may be a pointer: sizeof(T) is meant.
+    static std::size_t bytes(std::size_t n) noexcept {
+        return (n * sizeof(T) + kChunkAlign - 1) & ~(kChunkAlign - 1);  // NOLINT(bugprone-sizeof-expression)
+    }
+    T* allocate(std::size_t n) { return static_cast<T*>(::operator new(bytes(n), std::align_val_t{kChunkAlign})); }
+    void deallocate(T* p, std::size_t /*n*/) noexcept {
+        // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion): T may be a pointer
+        ::operator delete(p, std::align_val_t{kChunkAlign});
+    }
+    friend bool operator==(const LineAllocator& /*a*/, const LineAllocator& /*b*/) noexcept { return true; }
+};
+template <class T>
+using LineVector = std::vector<T, LineAllocator<T>>;
+
+// Bits of an actor's state that end its turn after the current message.
+inline constexpr std::uint8_t kActorStopped = 1;  // stop() was called
+inline constexpr std::uint8_t kActorPaused = 2;   // it sent past a transit pause mark
+
 // One thread of a VirtualWorker. It owns an arena with its actors' mailboxes, the actors
 // themselves and a queue of the ones with messages, and only its thread touches them.
 // Other workers reach it through its inbox: a lock-free list of batches of messages.
@@ -139,7 +166,7 @@ public:
         entries_[local.index_].box = std::move(box);  // a reused slot keeps its queued flag
         ++live_here_;
         shared_->live.fetch_add(1, std::memory_order_relaxed);
-        if (actor.stopped_) [[unlikely]]
+        if (actor.state_ != 0) [[unlikely]]
             retire(local.index_);  // it called stop() in its constructor
         return ref;
     }
@@ -183,7 +210,7 @@ public:
         }
         if (worker >= outboxes_.size()) return SendResult::DeadActor;
         Batch* batch = outboxes_[worker];
-        if (batch == nullptr || batch->capacity - batch->used < bytesFor<Msg>()) [[unlikely]] {
+        if (batch == nullptr || batch->used + bytesFor<Msg>() > batch->limit) [[unlikely]] {
             batch = refill(worker, bytesFor<Msg>());
             if (batch == nullptr) return SendResult::Full;
         }
@@ -231,6 +258,7 @@ private:
     struct Turn {
         std::size_t handled;
         bool stopped;
+        bool paused;
     };
 
     // One actor with its type erased: the worker makes one virtual call per turn, and the
@@ -248,21 +276,30 @@ private:
         virtual void destroyMailbox(MailboxArena& arena) noexcept = 0;
     };
 
+    // Whole cache lines: actors are created one after another on one thread and spread over the
+    // workers, so neighbours in memory run on different workers and would share lines.
     template <ActorType A>
-    struct Box final : ActorBox {
+    struct alignas(kChunkAlign) Box final : ActorBox {
         using Msg = typename A::Message;
 
         template <class... Args>
         explicit Box(Args&&... args) : actor(std::forward<Args>(args)...) {}
 
         Turn run(Worker& worker) override {
-            const Actor<Msg>& base = actor;
-            // After stop() the rest of the turn's messages are skipped; they die with the mailbox.
+            Actor<Msg>& base = actor;
+            // The turn ends after a message that stopped the actor (the rest of its mailbox dies
+            // with it) or paused it (see refill): the next message is left in the mailbox.
+            worker.running_ = &base.state_;
             const std::size_t handled = worker.arena_.drain(localOf(base.self_), kBudget, [this, &base](Msg& msg) {
-                if (!base.stopped_) [[likely]]
-                    actor.onMessage(msg);
+                if (base.state_ != 0) return false;  // checked first, as for stop() alone
+                actor.onMessage(msg);
+                return true;
             });
-            return {handled, base.stopped_};
+            worker.running_ = nullptr;
+            const std::uint8_t state = base.state_;
+            if ((state & kActorPaused) != 0) [[unlikely]]
+                base.state_ = state & kActorStopped;  // written only then: the actor's line stays clean
+            return {handled, (state & kActorStopped) != 0, (state & kActorPaused) != 0};
         }
 
         void destroyMailbox(MailboxArena& arena) noexcept override {
@@ -273,9 +310,12 @@ private:
         A actor;  // the state lives and dies with the box
     };
 
+    static constexpr std::uint32_t kNone = std::numeric_limits<std::uint32_t>::max();
+
     struct Entry {
         std::unique_ptr<ActorBox> box;  // null once its actor stopped
-        bool queued = false;            // in ready_ or running; a stopped slot keeps it until popped
+        bool queued = false;            // in ready_, running or paused; a stopped slot keeps it until popped
+        std::uint32_t next_paused = kNone;
     };
 
     // A batch of messages for another worker: a header line, then envelopes.
@@ -283,6 +323,21 @@ private:
         Batch* next = nullptr;  // inbox link
         std::uint32_t used = 0;
         std::uint32_t capacity = 0;
+        // An outbox's appends past limit take the slow path: limit is the capacity, or 0 while
+        // its worker is past the transit pause mark (see refill).
+        std::uint32_t limit = 0;
+        std::uint32_t from = kNone;  // the sending worker, credited once the batch is delivered
+    };
+
+    // Transit to one other worker, counted like a feed: the sender adds the capacity of every
+    // batch it takes for that worker, which adds it back once it has delivered the batch.
+    struct Transit {
+        std::uint64_t sent = 0;
+        std::uint64_t seen = 0;  // the worker's credit when last read: reading costs a cache miss
+    };
+    struct alignas(kChunkAlign) Credit {
+        std::atomic<std::uint64_t> delivered{0};  // written by the receiving worker only
+        std::atomic<bool> wake{false};            // set by the sender while it sleeps with paused actors
     };
     static constexpr std::size_t kBatchHeader = kChunkAlign;  // keeps the envelopes 64-byte aligned
     static constexpr std::uint32_t kBatchBytes = 4096 - kBatchHeader;
@@ -427,6 +482,13 @@ private:
     void runTurn(std::uint32_t slot);
     void retire(std::uint32_t slot) noexcept;
     Batch* refill(std::uint32_t worker, std::size_t bytes) noexcept;
+    [[nodiscard]] std::uint64_t creditFrom(std::uint32_t worker, std::memory_order order) const noexcept;
+    void credit(const Batch& batch) noexcept;
+    [[nodiscard]] bool pastResumeMark(std::uint32_t worker) noexcept;
+    void pauseActor(std::uint32_t slot) noexcept;
+    void resumePaused(bool all) noexcept;
+    [[nodiscard]] bool canResume() const noexcept;
+    void askForCredit(bool ask) noexcept;
     void flush() noexcept;
     void push(Batch* batch) noexcept;  // any thread
     void takeInbox() noexcept;
@@ -449,14 +511,14 @@ private:
     Shared* shared_;
     std::uint32_t id_;
     MailboxArena arena_;
-    std::vector<Entry> entries_;        // by mailbox index
-    std::vector<std::uint32_t> ready_;  // a ring of mailbox indices, sized to a power of two
+    LineVector<Entry> entries_;        // by mailbox index
+    LineVector<std::uint32_t> ready_;  // a ring of mailbox indices, sized to a power of two
     std::uint32_t ready_head_ = 0;
     std::uint32_t ready_tail_ = 0;
     std::size_t live_here_ = 0;
-    std::vector<Batch*> outboxes_;      // by destination worker
-    std::vector<std::uint32_t> dirty_;  // destinations with an outbox batch
-    std::vector<Batch*> spare_;         // empty batches for the next outboxes
+    LineVector<Batch*> outboxes_;       // by destination worker
+    LineVector<std::uint32_t> dirty_;   // destinations with an outbox batch
+    LineVector<Batch*> spare_;          // empty batches for the next outboxes
     Batch* pending_ = nullptr;          // taken from the inbox, not delivered yet; oldest first
     std::uint32_t pending_offset_ = 0;  // of the next envelope in pending_
     bool pressured_ = false;            // counted in shared_->pressured
@@ -465,8 +527,17 @@ private:
     Feed* feeds_ = nullptr;             // from the threads that send from outside, linked by next
     std::int64_t spin_ns_;              // how long idle() spins before it sleeps; adapts
     std::atomic<std::uint64_t> dropped_{0};
-    std::uint32_t turns_ = 0;         // since the last flush
-    std::uint32_t unread_turns_ = 0;  // since feeds were last read
+    std::uint32_t turns_ = 0;            // since the last flush
+    std::uint32_t unread_turns_ = 0;     // since feeds were last read
+    LineVector<Transit> transit_;        // by destination worker
+    std::vector<Credit> credits_;        // by source worker; never resized
+    std::uint64_t transit_budget_;       // bytes in transit to one worker; past it, sends return Full
+    std::uint64_t pause_mark_;           // past it, actors that send there are paused
+    std::uint64_t resume_mark_;          // below it everywhere, they run again
+    std::uint8_t* running_ = nullptr;    // the state of the actor whose turn it is
+    std::uint32_t paused_head_ = kNone;  // paused actors, linked by Entry::next_paused, oldest first
+    std::uint32_t paused_tail_ = kNone;
+    std::uint32_t paused_ = 0;
 
     // The fields other threads write, on a cache line of their own.
     static constexpr std::uint32_t kAwake = 0;
@@ -507,9 +578,12 @@ public:
 protected:
     ~Actor() = default;
 
-    // To any actor, on any worker. Full and DeadActor are only known for actors on this
-    // actor's worker. A message for another worker waits there while that worker's arena is
-    // full, and is dropped, and counted in VirtualWorker::droppedMessages, if the actor is gone.
+    // To any actor, on any worker. DeadActor is only known for actors on this actor's worker,
+    // and so is Full, but for one case: messages in transit to each other worker have a budget,
+    // and an actor that keeps sending to a worker that falls behind is paused between turns,
+    // until that worker catches up. Only an actor that sends the rest of the budget within one
+    // onMessage gets Full. A message for another worker waits there while that worker's arena
+    // is full, and is dropped, and counted in VirtualWorker::droppedMessages, if the actor is gone.
     template <actorlib::Message To, class... Args>
         requires std::constructible_from<To, Args...>
     SendResult send(ActorRef<To> to, Args&&... args) {
@@ -527,13 +601,13 @@ protected:
 
     // Ends the actor after the current message: the messages still in its mailbox are
     // dropped, and it is destroyed.
-    void stop() noexcept { stopped_ = true; }
+    void stop() noexcept { state_ |= detail::kActorStopped; }
 
 private:
     friend class detail::Worker;
     detail::Worker* worker_ = nullptr;
     ActorRef<Msg> self_;
-    bool stopped_ = false;
+    std::uint8_t state_ = 0;  // detail::kActorStopped and kActorPaused
 };
 
 struct VirtualWorkerConfig {

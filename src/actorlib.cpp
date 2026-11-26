@@ -29,7 +29,16 @@ namespace {
 // Each slab starts with a cache-line-sized header holding the next-slab link, so the
 // chunks after it stay aligned.
 constexpr std::size_t kSlabHeaderSize = kChunkAlign;
+
+// Even, since a slot's generation is even while it is dead, and 2^32 divided by the golden
+// ratio, so the start points of any few arenas lie far apart.
+constexpr std::uint32_t kGenerationStride = 0x9E3779B8;
+std::atomic<std::uint32_t> next_first_generation{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 }  // namespace
+
+std::uint32_t MailboxArena::nextFirstGeneration() noexcept {
+    return next_first_generation.fetch_add(kGenerationStride, std::memory_order_relaxed);
+}
 
 MailboxArena::MailboxArena(ArenaConfig config) {
     if (config.chunk_size < kChunkAlign || config.chunk_size % kChunkAlign != 0 ||
@@ -93,7 +102,7 @@ std::uint32_t MailboxArena::createSlot(std::size_t data_offset, std::size_t msg_
     } else {
         if (slots_.size() >= kNoSlot) throw std::length_error{"actorlib: too many mailboxes"};
         index = static_cast<std::uint32_t>(slots_.size());
-        slots_.emplace_back();
+        slots_.emplace_back().generation = first_generation_;
     }
     MailboxSlot& slot = slots_[index];
     std::uint8_t min_class = 0;
@@ -115,7 +124,8 @@ bool MailboxArena::destroySlot(std::uint32_t index, std::uint32_t generation) no
         chunk = next;
     }
     parkEmpty(slot);
-    ++slot.generation;  // odd -> even; after 2^31 reuses of one slot a stale ref could match again
+    ++slot.generation;  // odd -> even; after 2^31 reuses of one slot a stale ref could match again,
+                        // and after millions a ref made by another arena could
     slot.next_free = free_slots_;
     free_slots_ = index;
     return true;
@@ -216,6 +226,16 @@ constexpr std::uint64_t kThreadMaxBytes = std::uint64_t{32} << 20;
 // actors and the other workers send before they notice.
 constexpr std::size_t kHighMark = 2;
 constexpr std::size_t kLowMark = 4;
+// Bytes each worker may have in transit to one other worker: max_bytes / kTransitShare shared
+// among the workers, so the messages waiting for a worker never take more than that. An actor
+// that sends past 1 / kPauseShare of it is paused after the current message: a steady sender
+// is slowed down, and only one that sends the rest in a single onMessage meets Full. Paused
+// actors run again once their worker's transit to every worker is below 1 / kResumeShare of
+// the pause mark: resuming just below the mark would pause them again a few sends later.
+constexpr std::size_t kTransitShare = 2;
+constexpr std::uint64_t kPauseShare = 2;
+constexpr std::uint64_t kResumeShare = 2;
+constexpr std::uint64_t kMinTransitBatches = 4;  // the budget holds at least this many of the largest batches
 
 // An idle worker spins before it sleeps: waking a sleeping thread costs microseconds. How
 // long adapts to the gaps it sees, between these bounds.
@@ -368,7 +388,13 @@ Worker::Worker(std::uint32_t id, Shared& shared, std::size_t workers, ArenaConfi
       outboxes_(workers, nullptr),
       high_bytes_{config.max_bytes / kHighMark},
       low_bytes_{config.max_bytes / kLowMark},
-      spin_ns_{kInitialSpinNs} {
+      spin_ns_{kInitialSpinNs},
+      transit_(workers),
+      credits_(workers),
+      transit_budget_{std::max<std::uint64_t>(config.max_bytes / kTransitShare / workers,
+                                              kMinTransitBatches * (kBatchBytes + config.chunk_size))},
+      pause_mark_{transit_budget_ / kPauseShare},
+      resume_mark_{pause_mark_ / kResumeShare} {
     dirty_.reserve(workers);
     spare_.reserve(kSpareBatches);
 }
@@ -403,6 +429,8 @@ void Worker::loop() {
         if (pending_ != nullptr || inbox_.load(std::memory_order_relaxed) != nullptr) [[unlikely]]
             takeInbox();
         if (ready_head_ == ready_tail_) {
+            if (paused_ != 0) [[unlikely]]
+                resumePaused(pending_ != nullptr);
             readFeeds(kFeedReadIdle);
             if (ready_head_ != ready_tail_) continue;
             flush();
@@ -411,7 +439,11 @@ void Worker::loop() {
         }
         runTurn(ready_[ready_head_++ & (ready_.size() - 1)]);
         if (!dirty_.empty() && ++turns_ >= kFlushTurns) flush();
-        if (++unread_turns_ >= kFlushTurns) readFeeds(kFeedReadBusy);
+        if (++unread_turns_ >= kFlushTurns) {
+            readFeeds(kFeedReadBusy);
+            if (paused_ != 0) [[unlikely]]
+                resumePaused(false);
+        }
     }
 }
 
@@ -426,6 +458,8 @@ void Worker::runTurn(std::uint32_t slot) {
     if (turn.stopped) {
         entry.queued = false;
         retire(slot);
+    } else if (turn.paused) [[unlikely]] {
+        pauseActor(slot);  // stays queued: its next messages do not bring it back early
     } else if (turn.handled == kBudget) {
         ready_[ready_tail_++ & (ready_.size() - 1)] = slot;  // may have more: back of the line
     } else {
@@ -453,7 +487,7 @@ void Worker::reserve(std::uint32_t slot) {
     if (slot >= entries_.size()) entries_.resize(std::size_t{slot} + 1);
     if (ready_.size() >= entries_.size()) return;
     // Each mailbox is queued at most once, so a ring as large as entries_ never overflows.
-    std::vector<std::uint32_t> ring(std::bit_ceil(entries_.size()));
+    LineVector<std::uint32_t> ring(std::bit_ceil(entries_.size()));
     const std::uint32_t count = ready_tail_ - ready_head_;
     for (std::uint32_t i = 0; i < count; ++i) ring[i] = ready_[(ready_head_ + i) & (ready_.size() - 1)];
     ready_ = std::move(ring);
@@ -461,20 +495,129 @@ void Worker::reserve(std::uint32_t slot) {
     ready_tail_ = count;
 }
 
-// A new outbox batch for worker, with `bytes` free; nullptr when out of memory. The full
-// one goes to its worker at once. A worker id and a byte count; the names say which.
+// The slow path of a send to another worker: a batch with `bytes` free for the message, or
+// nullptr when the transit budget to that worker is used up, or out of memory. A full outbox
+// goes to its worker here. Past the pause mark, the actor whose turn it is gets paused, and so
+// does every actor that sends to that worker until it catches up: the outbox's limit of 0 sends
+// each of them here. A worker id and a byte count; the names say which.
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 Worker::Batch* Worker::refill(std::uint32_t worker, std::size_t bytes) noexcept {
+    Transit& transit = transit_[worker];
     Batch*& batch = outboxes_[worker];
-    Batch* fresh = takeBatch(bytes);
-    if (fresh == nullptr) return nullptr;
-    if (batch != nullptr) {
-        shared_->workers[worker]->push(batch);
-    } else {
-        dirty_.push_back(worker);  // reserved for every worker: never allocates
+    const bool room = batch != nullptr && batch->capacity - batch->used >= bytes;
+    const std::uint64_t need = transit.sent + (room ? 0 : std::max<std::size_t>(bytes, kBatchBytes));
+    bool over = false;
+    // The credit lives on a line the other worker writes: read it only near the pause mark.
+    if (need - transit.seen > pause_mark_) [[unlikely]] {
+        transit.seen = creditFrom(worker, std::memory_order_relaxed);
+        if (need - transit.seen > transit_budget_) return nullptr;
+        over = need - transit.seen > pause_mark_;
     }
-    batch = fresh;
+    if (over && running_ != nullptr) *running_ |= kActorPaused;  // not from a destructor: no turn to end
+    if (!room) {
+        Batch* fresh = takeBatch(bytes);
+        if (fresh == nullptr) return nullptr;
+        fresh->from = id_;
+        transit.sent += fresh->capacity;
+        if (batch != nullptr) {
+            shared_->workers[worker]->push(batch);
+        } else {
+            dirty_.push_back(worker);  // reserved for every worker: never allocates
+        }
+        batch = fresh;
+    }
+    batch->limit = over ? 0 : batch->capacity;
     return batch;
+}
+
+// The bytes of this worker's batches that worker has delivered.
+std::uint64_t Worker::creditFrom(std::uint32_t worker, std::memory_order order) const noexcept {
+    return shared_->workers[worker]->credits_[id_].delivered.load(order);
+}
+
+// This worker has delivered every message of batch into its arena: the sender may send that
+// much more. Only this worker writes the counter, so a plain store does. A sender about to
+// sleep with paused actors sees the credit, or this sees its wake flag (see idle). As for
+// feeds, the store-load fence is skipped when the sender fences for both before it sleeps.
+void Worker::credit(const Batch& batch) noexcept {
+    if (batch.from == kNone) return;  // an addActor request from another thread
+    Credit& credit = credits_[batch.from];
+    const std::uint64_t value = credit.delivered.load(std::memory_order_relaxed) + batch.capacity;
+    bool wake = false;
+    if (asymmetric_fences.load(std::memory_order_relaxed)) [[likely]] {
+        credit.delivered.store(value, std::memory_order_relaxed);
+        std::atomic_signal_fence(std::memory_order_seq_cst);  // keeps the compiler from swapping the two
+        wake = credit.wake.load(std::memory_order_relaxed);
+    } else {
+        credit.delivered.store(value, std::memory_order_seq_cst);
+        wake = credit.wake.load(std::memory_order_seq_cst);
+    }
+    if (wake) [[unlikely]]
+        shared_->workers[batch.from]->wake();
+}
+
+bool Worker::pastResumeMark(std::uint32_t worker) noexcept {
+    Transit& transit = transit_[worker];
+    if (transit.sent - transit.seen <= resume_mark_) return false;
+    transit.seen = creditFrom(worker, std::memory_order_relaxed);
+    return transit.sent - transit.seen > resume_mark_;
+}
+
+// The actor in slot sent to a worker past the pause mark. Paused actors stay queued, so the
+// ready queue keeps room for every one of them.
+void Worker::pauseActor(std::uint32_t slot) noexcept {
+    entries_[slot].next_paused = kNone;
+    if (paused_tail_ == kNone) {
+        paused_head_ = slot;
+    } else {
+        entries_[paused_tail_].next_paused = slot;
+    }
+    paused_tail_ = slot;
+    ++paused_;
+}
+
+// Puts the paused actors back in the ready queue once no worker they may send to is past the
+// pause mark: which ones each sends to is not known, so all wait for the slowest. With all,
+// they go back regardless: that is for a worker with nothing else to run that cannot deliver
+// what it holds. Its arena is full, and only its own actors, paused ones included, can drain
+// it; otherwise two full workers whose actors wait for each other would never move again.
+void Worker::resumePaused(bool all) noexcept {
+    if (!all) {
+        for (std::uint32_t worker = 0; worker < transit_.size(); ++worker) {
+            if (pastResumeMark(worker)) return;
+        }
+    }
+    for (std::uint32_t slot = paused_head_; slot != kNone; slot = entries_[slot].next_paused) {
+        ready_[ready_tail_++ & (ready_.size() - 1)] = slot;
+    }
+    paused_head_ = paused_tail_ = kNone;
+    paused_ = 0;
+}
+
+// Before this worker sleeps with paused actors (ask), it has every worker they wait for wake
+// it with its next credit, and after it wakes (!ask) it stops them. Only workers past the
+// resume mark matter: credit from any other one cannot let them run.
+void Worker::askForCredit(bool ask) noexcept {
+    for (std::uint32_t worker = 0; worker < transit_.size(); ++worker) {
+        std::atomic<bool>& wake = shared_->workers[worker]->credits_[id_].wake;
+        if (ask ? transit_[worker].sent - transit_[worker].seen <= resume_mark_
+                : !wake.load(std::memory_order_relaxed)) {
+            continue;
+        }
+        wake.store(ask, std::memory_order_seq_cst);
+    }
+}
+
+// Whether the paused actors may run again: idle() asks before it sleeps.
+bool Worker::canResume() const noexcept {
+    for (std::uint32_t worker = 0; worker < transit_.size(); ++worker) {
+        const Transit& transit = transit_[worker];
+        if (transit.sent - transit.seen > resume_mark_ &&
+            transit.sent - creditFrom(worker, std::memory_order_seq_cst) > resume_mark_) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void Worker::flush() noexcept {
@@ -531,6 +674,7 @@ bool Worker::deliverPending() noexcept {
         }
         pending_ = batch.next;
         pending_offset_ = 0;
+        credit(batch);
         recycle(&batch);
     }
     return true;
@@ -539,15 +683,20 @@ bool Worker::deliverPending() noexcept {
 // With no actor ready nothing is left to drain, whatever parked chunks still hold.
 bool Worker::pastHighMark() const noexcept { return ready_head_ != ready_tail_ && arena_.bytesInUse() > high_bytes_; }
 
-// Counts this worker in shared_->pressured while its arena is past the high mark or it holds
-// batches it could not deliver. The worker that brings the count back to 0 wakes the others:
-// a sleeping worker does not count messages waiting in feeds as work while it is not 0.
+// Counts this worker in shared_->pressured while its arena is past the high mark with actors
+// to run, paused ones included, or it holds batches it could not deliver. Paused actors count:
+// otherwise messages from outside would fill the arena while they wait, and leave no room for
+// the batches from other workers whose credit would let them run. The worker that brings the
+// count back to 0 wakes the others: a sleeping worker does not count messages waiting in feeds
+// as work while it is not 0.
 void Worker::updatePressure() noexcept {
+    const bool actors_to_run = ready_head_ != ready_tail_ || paused_ != 0;
     if (!pressured_) {
-        if (!pastHighMark() && pending_ == nullptr) return;
+        const bool past_high_mark = actors_to_run && arena_.bytesInUse() > high_bytes_;
+        if (!past_high_mark && pending_ == nullptr) return;
         pressured_ = true;
         shared_->pressured.fetch_add(1, std::memory_order_seq_cst);
-    } else if (pending_ == nullptr && (ready_head_ == ready_tail_ || arena_.bytesInUse() < low_bytes_)) {
+    } else if (pending_ == nullptr && (!actors_to_run || arena_.bytesInUse() < low_bytes_)) {
         pressured_ = false;
         if (shared_->pressured.fetch_sub(1, std::memory_order_seq_cst) == 1) {
             for (const auto& worker : shared_->workers) {
@@ -675,13 +824,22 @@ void Worker::idle() noexcept {
         pause();
         if (spin % kChecksPerClock == 0 && nanosSince(start) >= spin_ns_) break;
     }
+    // Otherwise the credit that lets the paused actors run could find this worker asleep, and
+    // leave it there.
+    const bool ask = paused_ != 0;
+    if (ask) [[unlikely]]
+        askForCredit(true);
     sleep_.store(kSleeping, std::memory_order_seq_cst);
-    if (asymmetric_fences.load(std::memory_order_relaxed)) heavyFence();  // pairs with postMessage
+    if (asymmetric_fences.load(std::memory_order_relaxed)) heavyFence();  // pairs with postMessage and credit
     if (hasWork()) {
         sleep_.store(kAwake, std::memory_order_relaxed);
+        if (ask) [[unlikely]]
+            askForCredit(false);
         return;
     }
     sleep_.wait(kSleeping, std::memory_order_seq_cst);
+    if (ask) [[unlikely]]
+        askForCredit(false);
     const std::int64_t gap = nanosSince(start);
     spin_ns_ = gap > kMaxSpinNs ? std::max(kMinSpinNs, spin_ns_ / 2) : std::min(kMaxSpinNs, 2 * gap);
 }
@@ -692,6 +850,8 @@ bool Worker::hasWork() const noexcept {
         (live_here_ != 0 && shared_->stopping.load(std::memory_order_seq_cst))) {
         return true;
     }
+    if (paused_ != 0 && canResume()) [[unlikely]]
+        return true;
     if (shared_->pressured.load(std::memory_order_seq_cst) != 0) return false;  // feeds wait; see updatePressure
     for (const Feed* feed = feeds_; feed != nullptr; feed = feed->next) {
         const Segment* segment = feed->head;
@@ -720,6 +880,8 @@ void Worker::recycle(Batch* batch) noexcept {
     }
     batch->used = 0;
     batch->next = nullptr;
+    batch->limit = 0;
+    batch->from = kNone;
     spare_.push_back(batch);  // reserved: never allocates
 }
 

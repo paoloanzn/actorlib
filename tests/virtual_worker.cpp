@@ -110,9 +110,11 @@ TEST_CASE("send returns Full while the workers are behind, and every message sen
 
 // Messages between workers must wait while the receiving worker's arena is full, never be
 // dropped: a dropped end marker leaves an actor waiting forever, which is how the Raydium
-// indexer benchmark once hung. Each item here becomes many parts for the other workers, so
-// the parts already in flight outgrow a worker's small arena long before slowing the sender
-// down could help. The test stops the actors itself, so a lost part fails it, not hangs it.
+// indexer benchmark once hung. Nor may the senders get Full for it: a worker that falls
+// behind slows down the actors that send to it instead, and code that ignores the result of
+// a send (as most does) must keep working. Each item here becomes many parts for the other
+// workers, so the parts in flight outgrow a worker's small arena again and again. The test
+// stops the actors itself, so a lost part fails it, not hangs it.
 TEST_CASE("messages between workers wait for room in a full arena instead of being dropped") {
     constexpr std::size_t kWorkers = 3;
     constexpr std::uint64_t kItems = 20'000;
@@ -195,6 +197,130 @@ TEST_CASE("messages between workers wait for room in a full arena instead of bei
     CHECK(totals.failed_sends.load() == 0);
     CHECK(system.droppedMessages() == 0);
     CHECK(totals.out_of_order.load() == 0);
+}
+
+// Messages in transit between workers have a bound, like the ones in an arena: an actor
+// that sends to another worker faster than that worker keeps up, all within one onMessage
+// (where it cannot be slowed down), must meet Full instead of making memory grow without
+// end. Full must not lose anything: every message sent with Ok arrives, in order.
+TEST_CASE("an actor that floods another worker within one onMessage meets Full, and loses nothing sent with Ok") {
+    struct Totals {
+        std::atomic<std::uint64_t> received{0};
+        std::atomic<std::uint64_t> out_of_order{0};
+        std::atomic<std::uint64_t> sent_ok{0};
+        std::atomic<bool> flooded{false};
+        std::atomic<bool> met_full{false};
+    };
+
+    class SlowSink : public Actor<Item> {
+    public:
+        explicit SlowSink(Totals* totals) : totals_{totals} {}
+        void onMessage(const Item& item) {
+            if (item.seq < next_) totals_->out_of_order.fetch_add(1, std::memory_order_relaxed);
+            next_ = item.seq + 1;
+            for (int i = 0; i < 200; ++i) work_ = work_ * 31 + item.seq;  // NOLINT(readability-magic-numbers)
+            totals_->received.fetch_add(1, std::memory_order_release);
+        }
+
+    private:
+        Totals* totals_;
+        std::uint64_t next_ = 0;
+        volatile std::uint64_t work_ = 0;
+    };
+
+    class Flooder : public Actor<Item> {
+    public:
+        Flooder(ActorRef<Item> sink, Totals* totals) : sink_{sink}, totals_{totals} {}
+        void onMessage(const Item& /*start*/) {
+            // Any finite limit is reached long before this bound, which only keeps a missing
+            // limit from eating all memory.
+            constexpr std::uint64_t kBound = std::uint64_t{1} << 22;
+            std::uint64_t seq = 0;
+            for (; seq < kBound; ++seq) {
+                if (send(sink_, Item{.seq = seq, .end = false}) != SendResult::Ok) break;
+            }
+            totals_->met_full.store(seq < kBound, std::memory_order_relaxed);
+            totals_->sent_ok.store(seq, std::memory_order_relaxed);
+            totals_->flooded.store(true, std::memory_order_release);
+        }
+
+    private:
+        ActorRef<Item> sink_;
+        Totals* totals_;
+    };
+
+    Totals totals;
+    VirtualWorker system{VirtualWorkerConfig{
+        .workers = 2, .arena = ArenaConfig{.chunk_size = 960, .initial_bytes = 64 << 10, .max_bytes = 256 << 10}}};
+    const auto sink = system.addActor<SlowSink>(&totals);          // worker 0
+    const auto flooder = system.addActor<Flooder>(sink, &totals);  // worker 1
+    system.start();
+    REQUIRE(sendPatiently(system, flooder, Item{.seq = 0, .end = false}) == SendResult::Ok);
+    const auto deadline = Clock::now() + kPatience;
+    while (!totals.flooded.load(std::memory_order_acquire) && Clock::now() < deadline) std::this_thread::yield();
+    REQUIRE(totals.flooded.load(std::memory_order_acquire));
+    const bool all_arrived = waitFor(totals.received, totals.sent_ok.load());
+    system.stop();
+    system.join();
+
+    CHECK(totals.met_full.load());
+    CHECK(all_arrived);
+    CHECK(totals.out_of_order.load() == 0);
+    CHECK(system.droppedMessages() == 0);
+}
+
+// A ref works only with the VirtualWorker that made it. Used with another one, it must fail
+// like a ref to a stopped actor, not reach whichever actor sits in the same mailbox slot
+// there: that actor may take another message type, and a message of the wrong size written
+// into its mailbox corrupts memory.
+TEST_CASE("a ref from another VirtualWorker reaches no actor of this one") {
+    struct Big {
+        std::array<std::uint64_t, 100> words;  // NOLINT(readability-magic-numbers)
+    };
+    class BigSink : public Actor<Big> {
+    public:
+        void onMessage(const Big& /*big*/) {}
+    };
+    class Counter : public Actor<Item> {
+    public:
+        explicit Counter(std::atomic<std::uint64_t>* received) : received_{received} {}
+        void onMessage(const Item& item) {
+            if (item.end) {
+                stop();
+                return;
+            }
+            received_->fetch_add(1, std::memory_order_relaxed);
+        }
+
+    private:
+        std::atomic<std::uint64_t>* received_;
+    };
+
+    constexpr std::uint64_t kSends = 100;
+    std::atomic<std::uint64_t> received{0};
+    std::atomic<std::uint64_t> unused{0};
+    VirtualWorker other{VirtualWorkerConfig{.workers = 1}};  // never started
+    const auto foreign_item = other.addActor<Counter>(&unused);
+    const auto foreign_big = other.addActor<BigSink>();
+    // Actors in the same worker and mailbox slots as the foreign refs: the first takes the same
+    // message type as its foreign twin, the second a far smaller one than its twin.
+    VirtualWorker system{VirtualWorkerConfig{.workers = 1}};
+    const auto first = system.addActor<Counter>(&received);
+    const auto second = system.addActor<Counter>(&received);
+    system.start();
+
+    for (std::uint64_t i = 0; i < kSends; ++i) {
+        CHECK(sendPatiently(system, foreign_item, Item{.seq = i, .end = false}) ==
+              SendResult::Ok);  // Ok: the worker has it
+        CHECK(sendPatiently(system, foreign_big, Big{}) == SendResult::Ok);
+    }
+    // This thread's messages arrive in order, so the foreign ones are all handled before these.
+    CHECK(sendPatiently(system, first, Item{.seq = 0, .end = true}) == SendResult::Ok);
+    CHECK(sendPatiently(system, second, Item{.seq = 0, .end = true}) == SendResult::Ok);
+    system.join();
+
+    CHECK(received.load() == 0);
+    CHECK(system.droppedMessages() == 2 * kSends);
 }
 
 // Each sending thread's messages arrive in the order it sent them, whatever the other
