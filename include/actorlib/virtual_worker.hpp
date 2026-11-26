@@ -253,6 +253,8 @@ public:
     void wake() noexcept;     // any thread
     void stopAll() noexcept;  // this worker's thread, or after its thread has ended
     [[nodiscard]] std::uint64_t dropped() const noexcept { return dropped_.load(std::memory_order_relaxed); }
+    // Parked in idle, or on its way there after its last send: see heavyFence.
+    [[nodiscard]] bool asleep() const noexcept { return sleep_.load(std::memory_order_seq_cst) == kSleeping; }
 
 private:
     struct Turn {

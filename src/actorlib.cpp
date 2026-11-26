@@ -337,6 +337,7 @@ void pause() noexcept {
 // never allocates. It leaves when the thread ends, after the thread's last send.
 struct FencedThread {
     thread_act_t port = MACH_PORT_NULL;  // until the thread joins
+    const Worker* worker = nullptr;      // the worker this thread runs, if any
     FencedThread* prev = nullptr;
     FencedThread* next = nullptr;
 
@@ -390,12 +391,13 @@ bool registerHeavyFence() noexcept {
 // Makes heavyFence cover the calling thread. Called before the thread first skips a
 // store-load fence, and before it first touches thread_feeds: thread_locals end in reverse
 // order, so the thread leaves only after its last send. Linux covers every thread anyway.
-void joinHeavyFence() noexcept {
+void joinHeavyFence(const Worker* worker = nullptr) noexcept {
 #if defined(__APPLE__)
     FencedThread& self = fenced_this_thread;
     if (self.port != MACH_PORT_NULL) return;
     os_unfair_lock_lock(&fenced_lock);
     self.port = pthread_mach_thread_np(pthread_self());
+    self.worker = worker;
     self.next = fenced_threads;
     if (fenced_threads != nullptr) fenced_threads->prev = &self;
     fenced_threads = &self;
@@ -406,6 +408,12 @@ void joinHeavyFence() noexcept {
 // A full fence on every thread that skips the store-load fence, this one included. Costs a
 // few microseconds, so only a worker about to sleep pays it. False if some thread may not
 // have fenced: the caller must not sleep then.
+//
+// On macOS it skips the workers that are asleep, which cannot be mid-send: interrupting a
+// thread costs about as much there whether it runs or not. A skipped worker's sends before it
+// fell asleep are visible here, since this reads its flag after they were released. Its sends
+// after it wakes see what this caller wrote before: it wakes by reading a store made after this
+// read its flag, or by storing one itself and fencing (see idle).
 bool heavyFence() noexcept {
 #if defined(__linux__)
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
@@ -416,7 +424,7 @@ bool heavyFence() noexcept {
     bool fenced = true;
     os_unfair_lock_lock(&fenced_lock);
     for (const FencedThread* thread = fenced_threads; thread != nullptr; thread = thread->next) {
-        if (thread->port == self) continue;
+        if (thread->port == self || (thread->worker != nullptr && thread->worker->asleep())) continue;
         kern_return_t result = interrupt(thread->port);
         while (result == KERN_ABORTED) result = interrupt(thread->port);  // our wait was cut short
         fenced = fenced && result == KERN_SUCCESS;
@@ -512,7 +520,7 @@ Worker::~Worker() {
 // on a busy worker for long, an idle one sends and receives right away, and a turn costs
 // no more for them.
 void Worker::loop() {
-    joinHeavyFence();  // credit skips the store-load fence
+    joinHeavyFence(this);  // credit skips the store-load fence
     while (!shared_->done.load(std::memory_order_acquire)) {
         if (live_here_ != 0 && shared_->stopping.load(std::memory_order_relaxed)) [[unlikely]]
             stopAll();
@@ -923,7 +931,9 @@ void Worker::idle() noexcept {
     sleep_.store(kSleeping, std::memory_order_seq_cst);
     // Pairs with postMessage and credit. Without the fence a send could go unseen: spin again.
     if ((asymmetric_fences.load(std::memory_order_relaxed) && !heavyFence()) || hasWork()) {
-        sleep_.store(kAwake, std::memory_order_relaxed);
+        // Fenced: a heavyFence that saw this worker asleep skipped it (see there).
+        sleep_.store(kAwake, std::memory_order_seq_cst);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         if (ask) [[unlikely]]
             askForCredit(false);
         return;
