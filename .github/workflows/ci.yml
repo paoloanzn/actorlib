@@ -1,6 +1,6 @@
-# Format check, clang-tidy lint, warning-free builds and tests with GCC and Clang on x86_64
-# and arm64, and the tests under AddressSanitizer and UndefinedBehaviorSanitizer. Runs on
-# every push to main and every pull request. The release workflow also calls it, so a
+# Format check, clang-tidy lint, warning-free builds and tests on Linux (GCC and Clang) and
+# macOS (Apple Clang), each on x86_64 and arm64, and the tests under AddressSanitizer and
+# UndefinedBehaviorSanitizer. Runs on every push to main and every pull request. The release workflow also calls it, so a
 # release is published only when CI passes on the tagged commit.
 name: CI
 
@@ -95,6 +95,46 @@ jobs:
       # them: shared runners are too noisy. benchmarks/bench.sh compares timings on one machine.
       - name: Benchmarks (smoke)
         run: build/benchmarks/actorlib_benchmarks --smoke
+
+  # macOS has its own heavy fence (no membarrier), so it gets its own job, with the
+  # sanitizers in it too.
+  test-macos:
+    name: Test (Apple Clang, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-15-intel]  # arm64, x86_64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            "-DCMAKE_CXX_FLAGS=-Wall -Wextra -Wpedantic -Werror" -DACTORLIB_BUILD_BENCHMARKS=ON
+          cmake --build build --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Benchmarks (smoke)
+        run: build/benchmarks/actorlib_benchmarks --smoke
+
+      # No LeakSanitizer: Apple Clang does not support it on macOS.
+      - name: Build (ASan + UBSan)
+        run: |
+          cmake -S . -B build-san -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
+          cmake --build build-san --parallel 4
+
+      - name: Test (ASan + UBSan)
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build-san --output-on-failure
 
   sanitizers:
     name: Test (ASan + UBSan)
