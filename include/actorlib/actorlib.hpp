@@ -134,12 +134,15 @@ public:
     }
 
     // Calls fn(msg) on up to `budget` messages in FIFO order; returns how many it handled.
+    // An fn that returns bool ends the drain by returning false: it has not handled that
+    // message, which stays at the head of the mailbox.
     // fn may send (to this mailbox too), create and destroy mailboxes, but must not drain
     // this mailbox. If fn throws, the message stays at the head of the mailbox.
     // fn is taken by value, like STL algorithms; pass std::ref(fn) to avoid the copy.
     template <Message Msg, class F>
         requires std::invocable<F&, Msg&>
     std::size_t drain(ActorRef<Msg> ref, std::size_t budget, F fn) {
+        constexpr bool kCanEnd = std::same_as<std::invoke_result_t<F&, Msg&>, bool>;
         std::size_t handled = 0;
         if (!isValid(ref.index_, ref.generation_)) return handled;
         // The read cursor lives in locals: fn cannot move it (it may not drain this mailbox,
@@ -154,7 +157,13 @@ public:
             while (handled < budget && head != end && (head != slot->tail || chunk != slot->tail_chunk)) {
                 // The slot holds a Msg constructed by send(); launder makes the cast well-defined.
                 // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-                fn(*std::launder(reinterpret_cast<Msg*>(at(chunk, head))));
+                Msg& msg = *std::launder(reinterpret_cast<Msg*>(at(chunk, head)));
+                if constexpr (kCanEnd) {
+                    // No [[unlikely]]: it moves fn's code out of line and costs the hot loop more.
+                    if (!fn(msg)) break;  // head != end, so the drain returns below
+                } else {
+                    fn(msg);
+                }
                 ++handled;
                 // fn may have destroyed this mailbox or grown slots_: look the slot up again.
                 if (!isValid(ref.index_, ref.generation_)) [[unlikely]]

@@ -93,6 +93,28 @@ TEST_CASE("drain handles at most budget messages") {
     CHECK(seen == sequence(10));
 }
 
+TEST_CASE("a handler that returns false ends the drain and leaves that message at the head") {
+    MailboxArena arena{kSmall};
+    auto ref = arena.create<Ping>();
+    // Past the first chunk, so the drain also ends at a chunk boundary.
+    for (std::uint32_t i = 0; i < 20; ++i) REQUIRE(arena.send(ref, Ping{i}) == SendResult::Ok);
+
+    std::vector<std::uint32_t> seen;
+    auto until = [&](std::uint32_t last) {
+        return [&seen, last](Ping& p) {
+            if (p.seq > last) return false;
+            seen.push_back(p.seq);
+            return true;
+        };
+    };
+    CHECK(arena.drain(ref, 100, until(4)) == 5);
+    CHECK(arena.pending(ref) == 15);
+    CHECK(arena.drain(ref, 100, until(kPingsPerChunk - 1)) == kPingsPerChunk - 5);
+    CHECK(arena.drain(ref, 100, until(100)) == 20 - kPingsPerChunk);
+    CHECK(seen == sequence(20));
+    CHECK(arena.pending(ref) == 0);
+}
+
 TEST_CASE("send returns Full once max_bytes is reached, and succeeds again after a drain") {
     MailboxArena arena{kSmall};
     auto ref = arena.create<Ping>();
