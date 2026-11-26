@@ -162,7 +162,7 @@ Every send returns a `SendResult`:
 | Result | From an actor (`Actor::send`) | From outside (`VirtualWorker::send`) |
 |---|---|---|
 | `Ok` | Delivered, or handed to the target's worker. | Queued for the target's worker. |
-| `Full` | The target is on this worker and its arena is at `max_bytes`. | The workers are behind. Wait and send again (see [backpressure](#backpressure)). |
+| `Full` | The target is on this worker and its arena is at `max_bytes`, or this actor sent another worker its whole transit budget within one `onMessage` (see [backpressure](#backpressure)). | The workers are behind. Wait and send again (see [backpressure](#backpressure)). |
 | `DeadActor` | The target is on this worker and has stopped, or the ref is null. | The ref is null. |
 
 A message to an actor on another worker is checked when that worker delivers it. If the
@@ -287,7 +287,7 @@ Each arena has a fixed cap, so the workers slow the senders down instead of grow
 without bound:
 
 1. A worker whose arena has more than half of `max_bytes` in use, while it has actors to
-   run, is **pressured**.
+   run (paused ones included), is **pressured**.
 2. While any worker is pressured, no worker reads the outside feeds. Messages from outside
    wait in their feeds while the workers catch up.
 3. Once 32 MiB of one thread's messages wait in its feeds, `VirtualWorker::send` returns
@@ -298,6 +298,11 @@ without bound:
 
 Messages between actors on different workers are never dropped for lack of room. If the
 target's arena is full, they wait at the target's worker, in order, until there is room.
+What may wait has a budget: each worker may have half of `max_bytes`, split among the
+workers, in transit to any one worker. An actor that sends to a worker past half of that
+budget is **paused** after the current message, and runs again once the workers it sends
+to catch up. A steady sender slows down instead of getting `Full`; only an actor that
+sends the whole budget within one `onMessage` gets `Full`.
 
 ## Examples
 
