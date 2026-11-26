@@ -7,7 +7,7 @@ actors on every core.
 - **Bloat-free.** About 1,400 lines of code in two headers and one source file. It needs
   only the standard library.
 - **Fast.** No locks anywhere on the message path. A message from one actor to another on
-  the same worker takes about 15 ns, and 4 workers move about 470 million messages per
+  the same worker takes about 7 ns, and 4 workers move about 470 million messages per
   second between their actors.¹
 - **Efficient.** Messages live in memory each worker reserves up front, so sending a
   message almost never allocates. A quiet mailbox costs 64 bytes and grows with its
