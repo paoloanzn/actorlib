@@ -94,6 +94,28 @@ FeedCache feedsOfThisThread(const Shared& shared) noexcept;  // fills thread_fee
 inline constinit std::atomic<bool> asymmetric_fences{false};
 void releaseFeed(Feed* feed) noexcept;  // by one of its two owners
 
+// Allocates whole cache lines. A worker's vectors are small and written on every turn: on a
+// line shared with another worker's data, each write would take the line from that worker.
+template <class T>
+struct LineAllocator {
+    using value_type = T;
+    LineAllocator() = default;
+    template <class U>
+    LineAllocator(const LineAllocator<U>& /*other*/) noexcept {}  // NOLINT(google-explicit-constructor)
+    // T may be a pointer: sizeof(T) is meant.
+    static std::size_t bytes(std::size_t n) noexcept {
+        return (n * sizeof(T) + kChunkAlign - 1) & ~(kChunkAlign - 1);  // NOLINT(bugprone-sizeof-expression)
+    }
+    T* allocate(std::size_t n) { return static_cast<T*>(::operator new(bytes(n), std::align_val_t{kChunkAlign})); }
+    void deallocate(T* p, std::size_t /*n*/) noexcept {
+        // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion): T may be a pointer
+        ::operator delete(p, std::align_val_t{kChunkAlign});
+    }
+    friend bool operator==(const LineAllocator& /*a*/, const LineAllocator& /*b*/) noexcept { return true; }
+};
+template <class T>
+using LineVector = std::vector<T, LineAllocator<T>>;
+
 // One thread of a VirtualWorker. It owns an arena with its actors' mailboxes, the actors
 // themselves and a queue of the ones with messages, and only its thread touches them.
 // Other workers reach it through its inbox: a lock-free list of batches of messages.
@@ -248,8 +270,10 @@ private:
         virtual void destroyMailbox(MailboxArena& arena) noexcept = 0;
     };
 
+    // Whole cache lines: actors are created one after another on one thread and spread over the
+    // workers, so neighbours in memory run on different workers and would share lines.
     template <ActorType A>
-    struct Box final : ActorBox {
+    struct alignas(kChunkAlign) Box final : ActorBox {
         using Msg = typename A::Message;
 
         template <class... Args>
@@ -449,14 +473,14 @@ private:
     Shared* shared_;
     std::uint32_t id_;
     MailboxArena arena_;
-    std::vector<Entry> entries_;        // by mailbox index
-    std::vector<std::uint32_t> ready_;  // a ring of mailbox indices, sized to a power of two
+    LineVector<Entry> entries_;        // by mailbox index
+    LineVector<std::uint32_t> ready_;  // a ring of mailbox indices, sized to a power of two
     std::uint32_t ready_head_ = 0;
     std::uint32_t ready_tail_ = 0;
     std::size_t live_here_ = 0;
-    std::vector<Batch*> outboxes_;      // by destination worker
-    std::vector<std::uint32_t> dirty_;  // destinations with an outbox batch
-    std::vector<Batch*> spare_;         // empty batches for the next outboxes
+    LineVector<Batch*> outboxes_;       // by destination worker
+    LineVector<std::uint32_t> dirty_;   // destinations with an outbox batch
+    LineVector<Batch*> spare_;          // empty batches for the next outboxes
     Batch* pending_ = nullptr;          // taken from the inbox, not delivered yet; oldest first
     std::uint32_t pending_offset_ = 0;  // of the next envelope in pending_
     bool pressured_ = false;            // counted in shared_->pressured

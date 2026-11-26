@@ -463,7 +463,7 @@ void Worker::reserve(std::uint32_t slot) {
     if (slot >= entries_.size()) entries_.resize(std::size_t{slot} + 1);
     if (ready_.size() >= entries_.size()) return;
     // Each mailbox is queued at most once, so a ring as large as entries_ never overflows.
-    std::vector<std::uint32_t> ring(std::bit_ceil(entries_.size()));
+    LineVector<std::uint32_t> ring(std::bit_ceil(entries_.size()));
     const std::uint32_t count = ready_tail_ - ready_head_;
     for (std::uint32_t i = 0; i < count; ++i) ring[i] = ready_[(ready_head_ + i) & (ready_.size() - 1)];
     ready_ = std::move(ring);
