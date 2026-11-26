@@ -254,6 +254,11 @@ constexpr int kPausesPerCheck = 4;
 constexpr std::int64_t kMinSpinNs = 2'000;  // when work comes rarely
 constexpr std::int64_t kInitialSpinNs = 50'000;
 constexpr std::int64_t kMaxSpinNs = 1'000'000;  // gaps longer than this are not worth spinning for
+// Messages from outside between two sleeps from which their senders skip the store-load
+// fence (see idle). A heavy fence costs several microseconds of CPU, the fence a few dozen
+// nanoseconds per message; how long the heavy fence takes says little, since it mostly waits
+// for busy cores to let the interrupted threads go.
+constexpr std::uint64_t kSkipFenceFrom = 256;
 using Clock = std::chrono::steady_clock;
 
 std::int64_t nanosSince(Clock::time_point start) noexcept {
@@ -492,7 +497,8 @@ Worker::Worker(std::uint32_t id, Shared& shared, std::size_t workers, ArenaConfi
       transit_budget_{std::max<std::uint64_t>(config.max_bytes / kTransitShare / workers,
                                               kMinTransitBatches * (kBatchBytes + config.chunk_size))},
       pause_mark_{transit_budget_ / kPauseShare},
-      resume_mark_{pause_mark_ / kResumeShare} {
+      resume_mark_{pause_mark_ / kResumeShare},
+      sleep_{asymmetric_fences.load(std::memory_order_relaxed) ? 0 : kFenced} {
     dirty_.reserve(workers);
     spare_.reserve(kSpareBatches);
 }
@@ -734,10 +740,15 @@ void Worker::push(Batch* batch) noexcept {
 
 // Seen by a sleeper: either it sees the new batch (or flag) after announcing its sleep, or
 // the waker sees the announcement here. Both sides use seq_cst, so one of them always does.
+// Clears kSleeping and keeps the rest, which only the worker changes: so a waker that read an
+// older value fails, and tries again on the one that replaced it while that one sleeps.
 void Worker::wake() noexcept {
-    if (sleep_.load(std::memory_order_seq_cst) == kSleeping) {
-        sleep_.store(kAwake, std::memory_order_seq_cst);
-        sleep_.notify_one();
+    std::uint32_t state = sleep_.load(std::memory_order_seq_cst);
+    while ((state & kSleeping) != 0) {
+        if (sleep_.compare_exchange_weak(state, state & ~kSleeping, std::memory_order_seq_cst)) {
+            sleep_.notify_one();
+            return;
+        }
     }
 }
 
@@ -864,6 +875,10 @@ void Worker::readFeeds(std::size_t budget) noexcept {
         }
     }
     if (shared_->pressured.load(std::memory_order_relaxed) != 0) return;
+    // Enough messages since this worker last slept: their senders may stop fencing now. The
+    // other way waits for the next sleep, which pays the heavy fence it then takes (see idle).
+    if (sleep_.load(std::memory_order_relaxed) == kFenced && skippingPays()) [[unlikely]]
+        sleep_.store(0, std::memory_order_relaxed);
     for (Feed** link = &feeds_; *link != nullptr;) {
         Feed* feed = *link;
         // Once its thread has ended, what it sent is all there: read to the end, then let go.
@@ -892,6 +907,7 @@ bool Worker::read(Feed& feed, std::size_t budget) noexcept {
                 return false;
             if (result != SendResult::Ok) countDropped();
             feed.read += envelope.size;
+            ++fed_;
         }
         Segment* next = segment->next.load(std::memory_order_acquire);
         if (next == nullptr) return true;
@@ -928,21 +944,34 @@ void Worker::idle() noexcept {
     const bool ask = paused_ != 0;
     if (ask) [[unlikely]]
         askForCredit(true);
-    sleep_.store(kSleeping, std::memory_order_seq_cst);
-    // Pairs with postMessage and credit. Without the fence a send could go unseen: spin again.
-    if ((asymmetric_fences.load(std::memory_order_relaxed) && !heavyFence()) || hasWork()) {
+    // Senders from outside skip their store-load fence only while that saves more than the
+    // heavy fence this worker then pays before it sleeps: with few messages between sleeps,
+    // they fence instead (kFenced), and the worker sleeps without one. Decided for the next
+    // wake; the heavy fence now is owed to the senders that skipped theirs since the last.
+    const bool asymmetric = asymmetric_fences.load(std::memory_order_relaxed);
+    const std::uint32_t was = sleep_.load(std::memory_order_relaxed);  // only this worker changes it now
+    const std::uint32_t next = skippingPays() ? 0 : kFenced;
+    fed_ = 0;
+    sleep_.store(kSleeping | next, std::memory_order_seq_cst);
+    // ask: pairs with credit. Without the fence a send could go unseen: spin again.
+    if ((asymmetric && (was != kFenced || ask) && !heavyFence()) || hasWork()) {
         // Fenced: a heavyFence that saw this worker asleep skipped it (see there).
-        sleep_.store(kAwake, std::memory_order_seq_cst);
+        sleep_.store(next, std::memory_order_seq_cst);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (ask) [[unlikely]]
             askForCredit(false);
         return;
     }
-    sleep_.wait(kSleeping, std::memory_order_seq_cst);
+    sleep_.wait(kSleeping | next, std::memory_order_seq_cst);
     if (ask) [[unlikely]]
         askForCredit(false);
     const std::int64_t gap = nanosSince(start);
     spin_ns_ = gap > kMaxSpinNs ? std::max(kMinSpinNs, spin_ns_ / 2) : std::min(kMaxSpinNs, 2 * gap);
+}
+
+// Whether senders from outside skipping their fence saves more than the heavy fence it costs.
+bool Worker::skippingPays() const noexcept {
+    return asymmetric_fences.load(std::memory_order_relaxed) && fed_ >= kSkipFenceFrom;
 }
 
 bool Worker::hasWork() const noexcept {
