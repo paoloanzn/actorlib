@@ -87,10 +87,11 @@ struct FeedCache {
 inline constinit thread_local FeedCache thread_feed_cache{};
 FeedCache feedsOfThisThread(const Shared& shared) noexcept;  // fills thread_feed_cache
 
-// Whether senders from outside skip the store-load fence before checking that a worker
-// sleeps. A sleeping worker cannot miss their messages anyway: before it sleeps, it makes
-// every running thread of the process execute a full fence (Linux membarrier). Set once,
-// before the first worker starts, and never changed after.
+// Whether threads may skip the store-load fence before checking that a worker sleeps: senders
+// from outside while their worker lets them (see Worker::idle), and workers giving credit. A
+// sleeping worker cannot miss their messages anyway: before it sleeps, it makes every thread
+// that skips it execute a full fence (membarrier on Linux; on macOS, it interrupts each of
+// them). Set once, before the first worker starts, and never changed after.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 inline constinit std::atomic<bool> asymmetric_fences{false};
 void releaseFeed(Feed* feed) noexcept;  // by one of its two owners
@@ -235,12 +236,17 @@ public:
                        Envelope{.run = &deliver<Msg>, .index = to.index_ & kSlotMask, .generation = to.generation_},
                        std::forward<Args>(args)...));
         // A worker going to sleep sees the message, or this sees it sleeping. A store-load
-        // fence costs a round trip to the core polling the line, so skip it when the worker
-        // fences for both before it sleeps.
+        // fence costs a round trip to the core polling the line, so skip it while the worker
+        // fences for both before it sleeps; otherwise the worker says so with kFenced.
         if (asymmetric_fences.load(std::memory_order_relaxed)) [[likely]] {
             segment.committed.store(feed->used, std::memory_order_release);
             std::atomic_signal_fence(std::memory_order_seq_cst);  // keeps the compiler from swapping the two
-            if (sleep_.load(std::memory_order_relaxed) == kSleeping) [[unlikely]]
+            std::uint32_t state = sleep_.load(std::memory_order_relaxed);
+            if (state == kFenced) {
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                state = sleep_.load(std::memory_order_relaxed);
+            }
+            if ((state & kSleeping) != 0) [[unlikely]]
                 wake();
         } else {
             segment.committed.store(feed->used, std::memory_order_seq_cst);
@@ -253,6 +259,8 @@ public:
     void wake() noexcept;     // any thread
     void stopAll() noexcept;  // this worker's thread, or after its thread has ended
     [[nodiscard]] std::uint64_t dropped() const noexcept { return dropped_.load(std::memory_order_relaxed); }
+    // Parked in idle, or on its way there after its last send: see heavyFence.
+    [[nodiscard]] bool asleep() const noexcept { return (sleep_.load(std::memory_order_seq_cst) & kSleeping) != 0; }
 
 private:
     struct Turn {
@@ -502,6 +510,7 @@ private:
     bool read(Feed& feed, std::size_t budget) noexcept;  // false while messages are left
     void idle() noexcept;
     [[nodiscard]] bool hasWork() const noexcept;
+    [[nodiscard]] bool skippingPays() const noexcept;
     Batch* takeBatch(std::size_t bytes) noexcept;
     void recycle(Batch* batch) noexcept;
     static Batch* newBatch(std::uint32_t capacity) noexcept;
@@ -538,13 +547,17 @@ private:
     std::uint32_t paused_head_ = kNone;  // paused actors, linked by Entry::next_paused, oldest first
     std::uint32_t paused_tail_ = kNone;
     std::uint32_t paused_ = 0;
+    std::uint64_t fed_ = 0;  // messages read from feeds since this worker last slept
 
-    // The fields other threads write, on a cache line of their own.
-    static constexpr std::uint32_t kAwake = 0;
+    // The fields other threads write, on a cache line of their own. sleep_ holds kSleeping
+    // while the worker sleeps, or is about to, and kFenced while senders must fence before
+    // they check it (see idle). Only this worker sets kFenced or clears it; wakers clear only
+    // kSleeping, from the very value they read.
     static constexpr std::uint32_t kSleeping = 1;
+    static constexpr std::uint32_t kFenced = 2;
     alignas(kChunkAlign) std::atomic<Batch*> inbox_{nullptr};  // newest first
     std::atomic<Feed*> joining_{nullptr};                      // feeds opened since the last look
-    std::atomic<std::uint32_t> sleep_{kAwake};
+    std::atomic<std::uint32_t> sleep_;
 };
 }  // namespace detail
 
