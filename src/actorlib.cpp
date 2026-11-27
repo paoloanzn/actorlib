@@ -396,7 +396,7 @@ bool registerHeavyFence() noexcept {
 // Makes heavyFence cover the calling thread. Called before the thread first skips a
 // store-load fence, and before it first touches thread_feeds: thread_locals end in reverse
 // order, so the thread leaves only after its last send. Linux covers every thread anyway.
-void joinHeavyFence(const Worker* worker = nullptr) noexcept {
+void joinHeavyFence([[maybe_unused]] const Worker* worker = nullptr) noexcept {
 #if defined(__APPLE__)
     FencedThread& self = fenced_this_thread;
     if (self.port != MACH_PORT_NULL) return;
